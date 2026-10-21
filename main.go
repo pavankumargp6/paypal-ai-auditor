@@ -22,11 +22,8 @@ type Transaction struct {
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file.")
-	}
-
+	// Load .env for local development, but don't crash if it's missing (e.g., on Render)
+	_ = godotenv.Load()
 	clientID := os.Getenv("PAYPAL_CLIENT_ID")
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
