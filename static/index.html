@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Subscription Auditor</title>
+    <!-- AG Grid -->
+    <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 40px; background-color: #f8f9fa; color: #333; }
+        h1 { color: #1a73e8; margin-bottom: 5px; }
+        .subtitle { color: #5f6368; margin-bottom: 25px; font-size: 1.1em; }
+        #myGrid { height: 400px; width: 100%; background-color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border-radius: 8px; }
+        .ag-theme-quartz { --ag-foreground-color: #202124; --ag-background-color: #ffffff; --ag-header-background-color: #f1f3f4; }
+        #loading-text { color: #1a73e8; font-weight: bold; margin-bottom: 15px; }
+    </style>
+</head>
+<body>
+    <h1>🤖 AI Subscription Auditor</h1>
+    <p class="subtitle">We analyzed your recent PayPal transactions using AI to find hidden costs.</p>
+    
+    <p id="loading-text">🔄 Analyzing transactions with AI... Please wait.</p>
+    <div id="myGrid" class="ag-theme-quartz"></div>
+
+    <script>
+        const columnDefs = [
+            { field: "merchant", headerName: "Merchant", sortable: true, filter: true, flex: 2 },
+            { field: "category", headerName: "Category", sortable: true, filter: true, flex: 1 },
+            { field: "amount", headerName: "Monthly Cost ($)", sortable: true, filter: true, flex: 1, cellStyle: { 'fontWeight': 'bold', 'color': '#d93025' } },
+            { field: "recommendation", headerName: "AI Recommendation", flex: 3 }
+        ];
+
+        const gridOptions = {
+            columnDefs: columnDefs,
+            rowData: [], // Start empty
+            pagination: true,
+            paginationPageSize: 10,
+            domLayout: 'autoHeight'
+        };
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const gridDiv = document.querySelector('#myGrid');
+            const gridApi = agGrid.createGrid(gridDiv, gridOptions);
+
+            // Fetch data from Go Backend
+            fetch('/api/analyze')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('loading-text').style.display = 'none';
+                    gridApi.setGridOption('rowData', data);
+                })
+                .catch(error => {
+                    document.getElementById('loading-text').innerText = '❌ Failed to load data. Check terminal.';
+                    console.error('Error:', error);
+                });
+        });
+    </script>
+</body>
+</html>
