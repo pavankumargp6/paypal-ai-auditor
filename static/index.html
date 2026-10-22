@@ -16,18 +16,7 @@
         .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
         .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
         
-        .paypal-btn {
-            background-color: #ffc439;
-            color: #003087;
-            border: none;
-            border-radius: 4px;
-            padding: 12px 30px;
-            font-size: 1.1rem;
-            font-weight: bold;
-            font-style: italic;
-            cursor: pointer;
-            transition: 0.2s;
-        }
+        .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; transition: 0.2s; }
         .paypal-btn:hover { background-color: #f2ba36; }
         .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     </style>
@@ -40,11 +29,11 @@
 
     <div class="summary-grid">
         <div class="card">
-            <div class="card-title">Total Captured Revenue</div>
+            <div class="card-title">Live Captured Revenue</div>
             <div class="card-value" id="total-revenue">$0.00</div>
         </div>
         <div class="card">
-            <div class="card-title">Successful Payments</div>
+            <div class="card-title">Successful Live Payments</div>
             <div class="card-value" id="total-success">0</div>
         </div>
         <div class="card">
@@ -58,7 +47,6 @@
             <h3 style="margin:0 0 5px 0;">Real PayPal Sandbox Checkout</h3>
             <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
         </div>
-        <!-- Custom Redirect Button -->
         <button class="paypal-btn" id="paypal-btn" onclick="startCheckout()">PayPal</button>
     </div>
 
@@ -73,14 +61,18 @@
                     { field: "id", headerName: "Capture ID", flex: 1 },
                     { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + p.value.toFixed(2) },
                     { field: "status", headerName: "Status", flex: 1 },
-                    { field: "date", headerName: "Date", flex: 1 }
+                    { field: "date", headerName: "Date", flex: 1 },
+                    // FIX 3: Visually distinguish real vs demo data
+                    { field: "is_live", headerName: "Source", flex: 1, 
+                      valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
+                      cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
+                    }
                 ],
                 rowData: []
             });
 
             refreshDashboard();
 
-            // Check if we just returned from a PayPal redirect
             const urlParams = new URLSearchParams(window.location.search);
             if (urlParams.has('success') && urlParams.has('token')) {
                 captureOrder(urlParams.get('token'));
@@ -104,7 +96,6 @@
                 });
         }
 
-        // 1. Start Checkout (Redirect)
         async function startCheckout() {
             const btn = document.getElementById('paypal-btn');
             btn.disabled = true;
@@ -114,8 +105,6 @@
                 const res = await fetch('/api/create-order', { method: 'POST' });
                 const data = await res.json();
                 if (data.error) throw new Error(data.error);
-                
-                // Redirect the whole browser to PayPal
                 window.location.href = data.approveURL;
             } catch (err) {
                 alert("Error: " + err.message);
@@ -124,9 +113,8 @@
             }
         }
 
-        // 2. Capture Order (After redirecting back)
         async function captureOrder(orderID) {
-            document.getElementById('ai-insight').innerText = "🤖 Capturing payment...";
+            document.getElementById('ai-insight').innerText = "🤖 Verifying and capturing payment...";
             try {
                 const res = await fetch('/api/capture-order', {
                     method: 'POST',
@@ -138,8 +126,6 @@
                 if (!res.ok || payment.error) throw new Error(payment.error || "Unknown error");
                 
                 alert(`✅ Payment Captured! ID: ${payment.id} for $${payment.amount}`);
-                
-                // Clean the URL so it doesn't capture twice on refresh
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
                 
