@@ -129,6 +129,10 @@ func main() {
 			return
 		}
 
+		if db == nil {
+			sendJSONError(w, "Database offline. Cannot persist capture.", 500)
+			return
+		}
 		if db != nil {
 			_, err = db.Exec(`INSERT INTO captures (id, amount, status, currency, date, is_live) 
 				VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
@@ -269,6 +273,9 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 			approveURL = link.Href
 			break
 		}
+	}
+	if approveURL == "" {
+		return "", "", fmt.Errorf("paypal response missing approval link")
 	}
 	return result.ID, approveURL, nil
 }
