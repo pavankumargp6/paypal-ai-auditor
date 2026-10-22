@@ -44,7 +44,7 @@
             <div class="card-value" id="total-success">0</div>
         </div>
         <div class="card">
-            <div class="card-title">Live Failures</div>
+            <div class="card-title">Demo Failures (Synthetic)</div>
             <div class="card-value" id="total-failed" style="color:#ef4444;">0</div>
         </div>
     </div>
@@ -57,7 +57,6 @@
         <button class="paypal-btn" id="paypal-btn" onclick="startCheckout()">PayPal</button>
     </div>
 
-    <!-- Table Controls -->
     <div class="controls">
         <h3 style="margin:0;">Transaction History</h3>
         <select class="filter-select" id="source-filter" onchange="applyFilter()">
@@ -71,6 +70,7 @@
 
     <script>
         let spendGridApi;
+        window.allTransactions = [];
 
         document.addEventListener('DOMContentLoaded', () => {
             spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
@@ -112,7 +112,7 @@
             fetch('/api/transactions')
                 .then(res => res.json())
                 .then(data => {
-                    window.allTransactions = data; // Store for filtering
+                    window.allTransactions = data;
                     applyFilter(); 
                 });
         }
@@ -126,14 +126,12 @@
             } else if (filter === 'demo') {
                 filteredData = filteredData.filter(r => r.is_live === false);
             }
-
             spendGridApi.setGridOption('rowData', filteredData);
         }
 
         async function startCheckout() {
             const btn = document.getElementById('paypal-btn');
             btn.disabled = true; btn.innerText = "Redirecting...";
-
             try {
                 const res = await fetch('/api/create-order', { method: 'POST' });
                 const data = await res.json();
