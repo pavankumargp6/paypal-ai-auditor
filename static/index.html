@@ -96,22 +96,30 @@
             }
         });
 
-        function refreshDashboard() {
-            fetch('/api/spend-intelligence')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('ai-insight').innerText = "🤖 " + data.ai_insight;
-                    document.getElementById('total-revenue').innerText = '$' + data.total_captured.toFixed(2);
-                    document.getElementById('total-success').innerText = data.live_success;
-                    document.getElementById('demo-success').innerText = data.demo_completed_count;
-                });
+        async function refreshDashboard() {
+            try {
+                const [intelRes, txRes] = await Promise.all([
+                    fetch('/api/spend-intelligence'),
+                    fetch('/api/transactions')
+                ]);
 
-            fetch('/api/transactions')
-                .then(res => res.json())
-                .then(data => {
-                    window.allTransactions = data;
-                    applyFilter(); 
-                });
+                if (!intelRes.ok) throw new Error("Failed to load metrics");
+                if (!txRes.ok) throw new Error("Failed to load transactions");
+
+                const intel = await intelRes.json();
+                const txData = await txRes.json();
+
+                document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
+                document.getElementById('total-revenue').innerText = '$' + intel.total_captured.toFixed(2);
+                document.getElementById('total-success').innerText = intel.live_success;
+                document.getElementById('demo-success').innerText = intel.demo_completed_count;
+
+                window.allTransactions = txData;
+                applyFilter(); 
+            } catch (err) {
+                document.getElementById('ai-insight').innerText = "❌ " + err.message;
+                console.error(err);
+            }
         }
 
         function applyFilter() {
@@ -131,6 +139,7 @@
             btn.disabled = true; btn.innerText = "Redirecting...";
             try {
                 const res = await fetch('/api/create-order', { method: 'POST' });
+                if (!res.ok) throw new Error("Server error creating order");
                 const data = await res.json();
                 if (data.error) throw new Error(data.error);
                 window.location.href = data.approveURL;
@@ -156,7 +165,6 @@
                     throw new Error("Server returned invalid response");
                 }
 
-                // Handle the persistence-pending state explicitly
                 if (data.status === "capture_succeeded_persistence_pending") {
                     alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
                     window.history.replaceState({}, document.title, "/");

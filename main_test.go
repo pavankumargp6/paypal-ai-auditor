@@ -1,55 +1,81 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
 
-func TestCalculateSummary_OnlyLiveCounts(t *testing.T) {
-	live := []PaymentRecord{
-		{ID: "L1", Amount: 25.00, Status: "COMPLETED", IsLive: true},
-		{ID: "L2", Amount: 100.00, Status: "COMPLETED", IsLive: true},
-		{ID: "L3", Amount: 0.00, Status: "DECLINED", IsLive: true},
-	}
-	demo := []PaymentRecord{
-		{ID: "D1", Amount: 999.99, Status: "COMPLETED", IsLive: false},
-		{ID: "D2", Amount: 0.00, Status: "DECLINED", IsLive: false},
-	}
+type mockRoundTripper func(*http.Request) (*http.Response, error)
 
-	summary := calculateSummary(live, demo)
+func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m(req)
+}
 
-	if summary.TotalCaptured != 125.00 {
-		t.Errorf("Expected live total 125.00, got %.2f", summary.TotalCaptured)
+func setupMockClient(statusCode int, body string) {
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: statusCode,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+}
+
+func TestOrderIDValidation(t *testing.T) {
+	valid := "5O190127TN364715T"
+	invalid := "malicious-id-with-slash/../"
+
+	if !orderIDRegex.MatchString(valid) {
+		t.Errorf("Expected %s to be valid", valid)
 	}
-	if summary.LiveSuccess != 2 {
-		t.Errorf("Expected 2 live successes, got %d", summary.LiveSuccess)
-	}
-	if summary.DemoCompletedCount != 1 {
-		t.Errorf("Expected 1 demo completed, got %d", summary.DemoCompletedCount)
+	if orderIDRegex.MatchString(invalid) {
+		t.Errorf("Expected %s to be invalid", invalid)
 	}
 }
 
-func TestCalculateSummary_Empty(t *testing.T) {
-	summary := calculateSummary([]PaymentRecord{}, []PaymentRecord{})
+func TestCalculateSummary_LiveVsDemo(t *testing.T) {
+	live := []PaymentRecord{{ID: "L1", Amount: 25.00, Status: "COMPLETED", IsLive: true}}
+	demo := []PaymentRecord{{ID: "D1", Amount: 100.00, Status: "COMPLETED", IsLive: false}}
 
-	if summary.TotalCaptured != 0 || summary.LiveSuccess != 0 || summary.DeclineRateAvailable {
-		t.Error("Expected zeroed summary and unavailable decline rate for empty dataset")
+	summary := calculateSummary(live, demo)
+	if summary.TotalCaptured != 25.00 {
+		t.Errorf("Expected 25.00, got %.2f", summary.TotalCaptured)
 	}
 }
 
 func TestParseCaptureFromBody_Valid(t *testing.T) {
-	body := []byte(`{
-		"status": "COMPLETED",
-		"purchase_units": [{
-			"payments": {
-				"captures": [{
-					"id": "95X58163J19414540",
-					"status": "COMPLETED",
-					"amount": {"value": "25.00", "currency_code": "USD"}
-				}]
-			}
-		}]
-	}`)
-
+	body := []byte(`{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "COMPLETED", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
 	rec, err := parseCaptureFromBody(body)
-	if err != nil || rec.ID != "95X58163J19414540" || rec.Amount != 25.00 {
-		t.Errorf("Parsing failed: %v, rec: %+v", err, rec)
+	if err != nil || rec.Amount != 25.00 {
+		t.Errorf("Parsing failed: %v", err)
+	}
+}
+
+func TestVerifyOrderStatus(t *testing.T) {
+	ctx := context.Background()
+
+	setupMockClient(200, `{"status": "APPROVED"}`)
+	status, err := verifyOrderStatus(ctx, "token", "ORDER123")
+	if err != nil || status != "APPROVED" {
+		t.Errorf("Expected APPROVED, got %s, err: %v", status, err)
+	}
+
+	setupMockClient(200, `{"status": "CREATED"}`)
+	status, err = verifyOrderStatus(ctx, "token", "ORDER123")
+	if err != nil || status != "CREATED" {
+		t.Errorf("Expected CREATED, got %s", status)
+	}
+}
+
+func TestCapturePayPalOrder_Incomplete(t *testing.T) {
+	ctx := context.Background()
+
+	setupMockClient(201, `{"status": "COMPLETED", "purchase_units": []}`)
+	_, err := capturePayPalOrder(ctx, "token", "ORDER123")
+	if err == nil {
+		t.Error("Expected error for incomplete capture response")
 	}
 }

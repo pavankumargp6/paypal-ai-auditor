@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,13 +21,14 @@ import (
 )
 
 const (
-	orderAmount   = 25.00
-	orderCurrency = "USD"
+	expectedAmount   = 25.00
+	expectedCurrency = "USD"
 )
 
 var (
-	db         *sql.DB
-	httpClient = &http.Client{Timeout: 15 * time.Second}
+	db           *sql.DB
+	httpClient   = &http.Client{Timeout: 15 * time.Second}
+	orderIDRegex = regexp.MustCompile(`^[A-Z0-9]{1,50}$`)
 )
 
 type PaymentRecord struct {
@@ -158,8 +161,10 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			sendJSONError(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		if reqBody.OrderID == "" {
-			sendJSONError(w, "Missing orderID", http.StatusBadRequest)
+
+		// 1. Validate order ID format
+		if !orderIDRegex.MatchString(reqBody.OrderID) {
+			sendJSONError(w, "Invalid order ID format", http.StatusBadRequest)
 			return
 		}
 
@@ -173,29 +178,50 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			return
 		}
 
-		payment, err := capturePayPalOrder(ctx, token, reqBody.OrderID)
+		// 2. Verify status server-side before capture
+		status, err := verifyOrderStatus(ctx, token, reqBody.OrderID)
 		if err != nil {
-			if strings.Contains(err.Error(), "ORDER_ALREADY_CAPTURED") {
-				log.Printf("capture: order %s already captured, reconciling", reqBody.OrderID)
-				payment, err = reconcileCapture(ctx, token, reqBody.OrderID)
-				if err != nil {
-					log.Printf("reconcile failed: %v", err)
-					sendJSONError(w, "Reconcile failed: "+err.Error(), http.StatusBadGateway)
-					return
-				}
-			} else {
-				log.Printf("capture error: %v", err)
-				sendJSONError(w, "Capture failed: "+err.Error(), http.StatusBadGateway)
-				return
-			}
-		}
-
-		if payment.Currency != orderCurrency {
-			log.Printf("CRITICAL: currency mismatch: got %s, expected %s", payment.Currency, orderCurrency)
-			sendJSONError(w, "Currency mismatch in PayPal response", http.StatusBadGateway)
+			log.Printf("verify status error: %v", err)
+			sendJSONError(w, "Failed to verify order status", http.StatusBadGateway)
 			return
 		}
 
+		var payment PaymentRecord
+
+		if status == "COMPLETED" {
+			// Reconcile already-captured order
+			log.Printf("order %s already COMPLETED, reconciling", reqBody.OrderID)
+			payment, err = reconcileCapture(ctx, token, reqBody.OrderID)
+			if err != nil {
+				sendJSONError(w, "Reconcile failed: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+		} else if status == "APPROVED" {
+			// Proceed with capture
+			payment, err = capturePayPalOrder(ctx, token, reqBody.OrderID)
+			if err != nil {
+				sendJSONError(w, "Capture failed: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+		} else {
+			// Reject unexpected states
+			sendJSONError(w, fmt.Sprintf("Order status is %s. Must be APPROVED.", status), http.StatusBadRequest)
+			return
+		}
+
+		// 3. Strict Amount & Currency Validation
+		if payment.Currency != expectedCurrency {
+			log.Printf("CRITICAL: currency mismatch: got %s, expected %s", payment.Currency, expectedCurrency)
+			sendJSONError(w, "Invalid currency in PayPal response", http.StatusBadGateway)
+			return
+		}
+		if math.Abs(payment.Amount-expectedAmount) > 0.001 {
+			log.Printf("CRITICAL: amount mismatch: got %.2f, expected %.2f", payment.Amount, expectedAmount)
+			sendJSONError(w, fmt.Sprintf("Invalid amount: expected %.2f, got %.2f", expectedAmount, payment.Amount), http.StatusBadGateway)
+			return
+		}
+
+		// 4. Persistence
 		if err := persistCapture(ctx, payment); err != nil {
 			correlationID := fmt.Sprintf("cap-%d", time.Now().UnixNano())
 			log.Printf("[%s] CRITICAL: capture %s succeeded but persistence failed: %v", correlationID, payment.ID, err)
@@ -331,7 +357,7 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 	payload := map[string]interface{}{
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]interface{}{
-			{"amount": map[string]string{"currency_code": orderCurrency, "value": fmt.Sprintf("%.2f", orderAmount)}},
+			{"amount": map[string]string{"currency_code": expectedCurrency, "value": fmt.Sprintf("%.2f", expectedAmount)}},
 		},
 		"application_context": map[string]string{
 			"return_url": returnURL,
@@ -380,6 +406,34 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 		}
 	}
 	return result.ID, approveURL, nil
+}
+
+func verifyOrderStatus(ctx context.Context, token, orderID string) (string, error) {
+	url := fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s", orderID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build verify request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("verify request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("verify status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode verify: %w", err)
+	}
+	return result.Status, nil
 }
 
 func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentRecord, error) {
