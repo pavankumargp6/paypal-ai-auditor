@@ -30,7 +30,7 @@ var (
 	httpClient   = &http.Client{Timeout: 15 * time.Second}
 	orderIDRegex = regexp.MustCompile(`^[A-Z0-9]{1,50}$`)
 
-	// Abstracted for testing
+	// Abstracted as a variable so it can be mocked in handler tests
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
 		_, err := db.ExecContext(ctx, `INSERT INTO captures (id, amount, status, currency, date, is_live)
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
@@ -138,7 +138,7 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 		returnURL := "https://paypal-ai-auditor.onrender.com/?success=true"
 		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL)
 		if err != nil {
-			sendJSONError(w, "Order creation failed", 502)
+			sendJSONError(w, "Order creation failed: "+err.Error(), 502)
 			return
 		}
 		if approveURL == "" {
@@ -198,13 +198,14 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			return
 		}
 
-		// CRITICAL FIX: Use the validation helper!
+		// 1. Validate Amount/Currency
 		if err := validatePayment(payment); err != nil {
 			log.Printf("CRITICAL: payment validation failed: %v", err)
 			sendJSONError(w, err.Error(), 502)
 			return
 		}
 
+		// 2. Persist to DB
 		if err := persistCapture(ctx, payment); err != nil {
 			correlationID := fmt.Sprintf("cap-%d", time.Now().UnixNano())
 			log.Printf("[%s] CRITICAL: capture succeeded but persistence failed: %v", correlationID, err)

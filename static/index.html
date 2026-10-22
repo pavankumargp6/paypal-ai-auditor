@@ -64,7 +64,7 @@
         </select>
     </div>
 
-    <!-- Fixed HTML attribute -->
+    <!-- FIXED: Single class attribute -->
     <div id="spendGrid" class="grid-container ag-theme-quartz"></div>
 
     <script>
@@ -89,7 +89,6 @@
                 defaultColDef: { resizable: true }
             });
 
-            // Small delay to ensure grid API is fully ready before fetching data
             setTimeout(refreshDashboard, 100);
 
             const urlParams = new URLSearchParams(window.location.search);
@@ -117,16 +116,9 @@
                 document.getElementById('demo-success').innerText = intel.demo_completed_count;
 
                 window.allTransactions = txData;
-                
-                // Force grid update
-                if (spendGridApi) {
-                    applyFilter(); 
-                } else {
-                    console.error("Grid API not ready yet");
-                }
+                applyFilter(); 
             } catch (err) {
                 document.getElementById('ai-insight').innerText = "❌ " + err.message;
-                console.error(err);
             }
         }
 
@@ -168,11 +160,7 @@
                 });
 
                 let data;
-                try {
-                    data = await res.json();
-                } catch (e) {
-                    throw new Error("Server returned invalid response");
-                }
+                try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
 
                 if (data.status === "capture_succeeded_persistence_pending") {
                     alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
