@@ -8,17 +8,20 @@
         body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 40px; background: #f4f7f9; color: #1e293b; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
         .header h1 { margin: 0; font-size: 2rem; color: #0f172a; }
-        .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; }
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
         .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
+        
+        .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
+
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
-        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 500px; }
+        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
         .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
         
-        .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; transition: 0.2s; }
+        .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
         .paypal-btn:hover { background-color: #f2ba36; }
-        .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -29,15 +32,19 @@
 
     <div class="summary-grid">
         <div class="card">
-            <div class="card-title">Sandbox Captured Revenue</div>
+            <div class="card-title">Live Captured Revenue</div>
             <div class="card-value" id="total-revenue">$0.00</div>
         </div>
         <div class="card">
-            <div class="card-title">Successful Sandbox Payments</div>
+            <div class="card-title">Live Success Rate</div>
+            <div class="card-value" id="success-rate" style="color:#10b981;">0%</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Live Successful Payments</div>
             <div class="card-value" id="total-success">0</div>
         </div>
         <div class="card">
-            <div class="card-title">Failed / Declined</div>
+            <div class="card-title">Live Failures</div>
             <div class="card-value" id="total-failed" style="color:#ef4444;">0</div>
         </div>
     </div>
@@ -48,6 +55,16 @@
             <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
         </div>
         <button class="paypal-btn" id="paypal-btn" onclick="startCheckout()">PayPal</button>
+    </div>
+
+    <!-- Table Controls -->
+    <div class="controls">
+        <h3 style="margin:0;">Transaction History</h3>
+        <select class="filter-select" id="source-filter" onchange="applyFilter()">
+            <option value="all">Show All Data</option>
+            <option value="live">Show ONLY Live PayPal Sandbox</option>
+            <option value="demo">Show ONLY Synthetic Demo Data</option>
+        </select>
     </div>
 
     <div class="grid-container" id="spendGrid" class="ag-theme-quartz"></div>
@@ -67,11 +84,6 @@
                     { field: "is_live", headerName: "Source", flex: 2, 
                       valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
                       cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
-                    },
-                    // FIX 3: Transaction Detail View
-                    { headerName: "Details", flex: 2, 
-                      valueGetter: p => `${p.data.id} | $${p.data.amount.toFixed(2)} | ${p.data.status} | ${p.data.date} | ${p.data.is_live ? 'Live' : 'Demo'}`,
-                      cellStyle: { 'fontSize': '0.85rem', 'color': '#64748b' }
                     }
                 ],
                 rowData: [],
@@ -92,21 +104,35 @@
                 .then(data => {
                     document.getElementById('ai-insight').innerText = "🤖 " + data.ai_insight;
                     document.getElementById('total-revenue').innerText = '$' + data.total_captured.toFixed(2);
-                    document.getElementById('total-success').innerText = data.total_count;
-                    document.getElementById('total-failed').innerText = data.failed_count;
+                    document.getElementById('success-rate').innerText = data.success_rate.toFixed(1) + '%';
+                    document.getElementById('total-success').innerText = data.live_success;
+                    document.getElementById('total-failed').innerText = data.live_failed;
                 });
 
             fetch('/api/transactions')
                 .then(res => res.json())
                 .then(data => {
-                    spendGridApi.setGridOption('rowData', data);
+                    window.allTransactions = data; // Store for filtering
+                    applyFilter(); 
                 });
+        }
+
+        function applyFilter() {
+            const filter = document.getElementById('source-filter').value;
+            let filteredData = window.allTransactions || [];
+
+            if (filter === 'live') {
+                filteredData = filteredData.filter(r => r.is_live === true);
+            } else if (filter === 'demo') {
+                filteredData = filteredData.filter(r => r.is_live === false);
+            }
+
+            spendGridApi.setGridOption('rowData', filteredData);
         }
 
         async function startCheckout() {
             const btn = document.getElementById('paypal-btn');
-            btn.disabled = true;
-            btn.innerText = "Redirecting...";
+            btn.disabled = true; btn.innerText = "Redirecting...";
 
             try {
                 const res = await fetch('/api/create-order', { method: 'POST' });
@@ -115,8 +141,7 @@
                 window.location.href = data.approveURL;
             } catch (err) {
                 alert("Error: " + err.message);
-                btn.disabled = false;
-                btn.innerText = "PayPal";
+                btn.disabled = false; btn.innerText = "PayPal";
             }
         }
 
