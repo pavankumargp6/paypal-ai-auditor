@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,10 +11,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
 // --- Structs ---
@@ -33,16 +34,35 @@ type SpendSummary struct {
 	AIInsight     string  `json:"ai_insight"`
 }
 
-var (
-	recordsLock     sync.Mutex
-	capturedRecords []PaymentRecord
-	dataFile        = "captures.json"
-)
+var db *sql.DB
 
 func main() {
 	_ = godotenv.Load()
-	// Load existing records from disk (survives restarts)
-	loadRecords()
+
+	// 1. Initialize Database
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL != "" {
+		var err error
+		db, err = sql.Open("postgres", dbURL)
+		if err != nil {
+			fmt.Println("⚠️ Failed to connect to DB:", err)
+		} else {
+			// Create table if it doesn't exist
+			_, err = db.Exec(`CREATE TABLE IF NOT EXISTS captures (
+				id TEXT PRIMARY KEY, 
+				amount FLOAT, 
+				status TEXT, 
+				currency TEXT, 
+				date TEXT, 
+				is_live BOOLEAN
+			)`)
+			if err != nil {
+				fmt.Println("⚠️ Failed to create table:", err)
+			} else {
+				fmt.Println("✅ Database connected and table ready.")
+			}
+		}
+	}
 
 	clientID := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_SECRET"))
@@ -102,7 +122,6 @@ func main() {
 			return
 		}
 
-		// Verify order is actually APPROVED
 		isApproved, err := verifyPayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil || !isApproved {
 			sendJSONError(w, "Order is not approved by buyer yet.", http.StatusBadRequest)
@@ -115,18 +134,17 @@ func main() {
 			return
 		}
 
-		// Duplicate Protection
-		recordsLock.Lock()
-		for _, existing := range capturedRecords {
-			if existing.ID == payment.ID {
-				recordsLock.Unlock()
-				sendJSONError(w, "This payment has already been captured.", http.StatusConflict)
+		// FIX 1 & 2: Save to Database (Prevents duplicates via PRIMARY KEY)
+		if db != nil {
+			_, err = db.Exec(`INSERT INTO captures (id, amount, status, currency, date, is_live) 
+				VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+				payment.ID, payment.Amount, payment.Status, payment.Currency, payment.Date, payment.IsLive)
+
+			if err != nil {
+				sendJSONError(w, "Failed to save to database: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 		}
-		capturedRecords = append(capturedRecords, payment)
-		saveRecords() // Persist to disk
-		recordsLock.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(payment)
@@ -136,11 +154,9 @@ func main() {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		recordsLock.Lock()
-		allRecords := append([]PaymentRecord{}, capturedRecords...)
-		recordsLock.Unlock()
-
+		allRecords := getRecordsFromDB()
 		allRecords = append(allRecords, getMockSpendRecords()...)
+
 		summary := calculateSpendIntelligence(allRecords)
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
 
@@ -149,9 +165,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
-		recordsLock.Lock()
-		allRecords := append([]PaymentRecord{}, capturedRecords...)
-		recordsLock.Unlock()
+		allRecords := getRecordsFromDB()
 		allRecords = append(allRecords, getMockSpendRecords()...)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -166,18 +180,25 @@ func main() {
 	http.ListenAndServe(":"+port, mux)
 }
 
-// --- Persistence Helpers ---
-func loadRecords() {
-	file, err := os.ReadFile(dataFile)
-	if err == nil {
-		json.Unmarshal(file, &capturedRecords)
+func getRecordsFromDB() []PaymentRecord {
+	var records []PaymentRecord
+	if db == nil {
+		return records
 	}
-}
 
-func saveRecords() {
-	// Note: Must be called while recordsLock is held
-	data, _ := json.MarshalIndent(capturedRecords, "", "  ")
-	os.WriteFile(dataFile, data, 0644)
+	rows, err := db.Query("SELECT id, amount, status, currency, date, is_live FROM captures ORDER BY date DESC")
+	if err != nil {
+		return records
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p PaymentRecord
+		if err := rows.Scan(&p.ID, &p.Amount, &p.Status, &p.Currency, &p.Date, &p.IsLive); err == nil {
+			records = append(records, p)
+		}
+	}
+	return records
 }
 
 func sendJSONError(w http.ResponseWriter, msg string, code int) {
@@ -282,7 +303,6 @@ func verifyPayPalOrder(ctx context.Context, token, orderID string) (bool, error)
 		Status string `json:"status"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-
 	return result.Status == "APPROVED", nil
 }
 
@@ -327,9 +347,8 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 	}
 
 	capture := paypalResult.PurchaseUnits[0].Payments.Captures[0]
-
 	if capture.Status != "COMPLETED" {
-		return PaymentRecord{}, fmt.Errorf("capture status is %s, expected COMPLETED", capture.Status)
+		return PaymentRecord{}, fmt.Errorf("capture status is %s", capture.Status)
 	}
 
 	var amt float64
@@ -372,13 +391,12 @@ func calculateSpendIntelligence(records []PaymentRecord) SpendSummary {
 }
 
 func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	// FIX 2: Force AI to use evidence and distinguish failures
 	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze this exact payment data:
 Live Captured Revenue: $%.2f
 Successful Payments: %d
 Failed Payments: %d
 
-Based ONLY on these numbers, provide a 1-sentence actionable insight. If there are failures, suggest improving checkout. If there are successes and no failures, suggest retaining customers. Max 20 words.`, summary.TotalCaptured, summary.TotalCount, summary.FailedCount)
+Based ONLY on these numbers, provide a 1-sentence actionable insight. Max 20 words.`, summary.TotalCaptured, summary.TotalCount, summary.FailedCount)
 
 	payload := map[string]interface{}{"model": "openai/gpt-oss-20b", "messages": []map[string]string{{"role": "user", "content": prompt}}}
 	jsonPayload, _ := json.Marshal(payload)
