@@ -10,12 +10,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
-// --- Structs for Spend Intelligence ---
+// --- Structs ---
 type PaymentRecord struct {
 	ID       string  `json:"id"`
 	Amount   float64 `json:"amount"`
@@ -31,7 +32,14 @@ type SpendSummary struct {
 	AIInsight     string  `json:"ai_insight"`
 }
 
-// --- Main App ---
+// --- Global In-Memory Store (Development Only) ---
+// NOTE: In a real production app, this would be a PostgreSQL database.
+// Render's free tier will wipe this data on restart.
+var (
+	recordsLock     sync.Mutex
+	capturedRecords []PaymentRecord
+)
+
 func main() {
 	_ = godotenv.Load()
 	clientID := os.Getenv("PAYPAL_CLIENT_ID")
@@ -41,7 +49,13 @@ func main() {
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/", fs)
 
-	// 1. Real PayPal Checkout Flow
+	// 0. Config endpoint for frontend to get the Client ID
+	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"clientId": clientID})
+	})
+
+	// 1. Create Order
 	http.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -56,15 +70,20 @@ func main() {
 			return
 		}
 
-		orderID, err := createPayPalOrder(ctx, token)
+		orderID, approveURL, err := createPayPalOrder(ctx, token)
 		if err != nil {
 			sendJSONError(w, "Failed to create order: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"orderID": orderID})
+		json.NewEncoder(w).Encode(map[string]string{
+			"id":         orderID,
+			"approveURL": approveURL,
+		})
 	})
 
+	// 2. Capture Order (Only called after buyer approves)
 	http.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -89,38 +108,53 @@ func main() {
 
 		payment, err := capturePayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil {
-			sendJSONError(w, "Failed to capture order: "+err.Error(), http.StatusInternalServerError)
+			// Catch the specific ORDER_NOT_APPROVED error
+			if strings.Contains(err.Error(), "ORDER_NOT_APPROVED") {
+				sendJSONError(w, "Buyer has not approved the order yet.", http.StatusBadRequest)
+				return
+			}
+			sendJSONError(w, "Capture failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		// Persist to memory (safely)
+		recordsLock.Lock()
+		capturedRecords = append(capturedRecords, payment)
+		recordsLock.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(payment)
 	})
 
-	// 2. Spend Intelligence Analysis
+	// 3. Spend Intelligence (Combines real captures + demo data)
 	http.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
-		// For the demo, we simulate the transactions this app has captured.
-		// In production, you would fetch these from your database or PayPal API.
-		records := getMockSpendRecords()
-		summary := calculateSpendIntelligence(records)
+		recordsLock.Lock()
+		allRecords := append([]PaymentRecord{}, capturedRecords...)
+		recordsLock.Unlock()
+
+		// Add demo data so the dashboard always has content
+		allRecords = append(allRecords, getMockSpendRecords()...)
+
+		summary := calculateSpendIntelligence(allRecords)
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(summary)
 	})
 
-	// 3. Keep the Subscription Engine for the secondary demo
-	http.HandleFunc("/api/analyze-subscriptions", func(w http.ResponseWriter, r *http.Request) {
-		// (Your existing subscription logic goes here, returning the demo data)
+	// 4. Get transaction list for the grid
+	http.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
+		recordsLock.Lock()
+		allRecords := append([]PaymentRecord{}, capturedRecords...)
+		recordsLock.Unlock()
+
+		allRecords = append(allRecords, getMockSpendRecords()...)
+
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(getMockSubscriptionsJSON()))
+		json.NewEncoder(w).Encode(allRecords)
 	})
 
 	port := os.Getenv("PORT")
@@ -137,6 +171,7 @@ func sendJSONError(w http.ResponseWriter, msg string, code int) {
 }
 
 // --- PayPal API Helpers ---
+
 func getPayPalToken(ctx context.Context, clientID, secret string) (string, error) {
 	apiURL := "https://api-m.sandbox.paypal.com/v1/oauth2/token"
 	data := url.Values{}
@@ -151,6 +186,11 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("auth failed with status %d", resp.StatusCode)
+	}
+
 	var result struct {
 		AccessToken string `json:"access_token"`
 	}
@@ -159,7 +199,7 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 	return result.AccessToken, nil
 }
 
-func createPayPalOrder(ctx context.Context, token string) (string, error) {
+func createPayPalOrder(ctx context.Context, token string) (string, string, error) {
 	payload := map[string]interface{}{
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]interface{}{
@@ -174,20 +214,37 @@ func createPayPalOrder(ctx context.Context, token string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("PayPal error: %s", string(body))
+		return "", "", fmt.Errorf("PayPal error: %s", string(body))
 	}
 
 	var result struct {
-		ID string `json:"id"`
+		ID    string `json:"id"`
+		Links []struct {
+			Href string `json:"href"`
+			Rel  string `json:"rel"`
+		} `json:"links"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-	return result.ID, nil
+
+	var approveURL string
+	for _, link := range result.Links {
+		if link.Rel == "approve" {
+			approveURL = link.Href
+			break
+		}
+	}
+
+	if approveURL == "" {
+		return "", "", fmt.Errorf("no approve link found")
+	}
+
+	return result.ID, approveURL, nil
 }
 
 func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentRecord, error) {
@@ -205,10 +262,9 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return PaymentRecord{}, fmt.Errorf("Capture failed: %s", string(body))
+		return PaymentRecord{}, fmt.Errorf("%s", string(body))
 	}
 
-	// Parse the capture result
 	var paypalResult struct {
 		ID            string `json:"id"`
 		Status        string `json:"status"`
@@ -245,13 +301,12 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 }
 
 // --- Spend Intelligence Engine ---
+
 func getMockSpendRecords() []PaymentRecord {
-	// Simulates historical payments to show the dashboard
 	return []PaymentRecord{
-		{ID: "CAP-101", Amount: 25.00, Status: "COMPLETED", Currency: "USD", Date: "2026-10-01"},
-		{ID: "CAP-102", Amount: 150.50, Status: "COMPLETED", Currency: "USD", Date: "2026-10-05"},
-		{ID: "CAP-103", Amount: 45.00, Status: "COMPLETED", Currency: "USD", Date: "2026-10-08"},
-		{ID: "CAP-104", Amount: 0.00, Status: "DECLINED", Currency: "USD", Date: "2026-10-10"},
+		{ID: "DEMO-CAP-101", Amount: 25.00, Status: "COMPLETED", Currency: "USD", Date: "2026-10-01"},
+		{ID: "DEMO-CAP-102", Amount: 150.50, Status: "COMPLETED", Currency: "USD", Date: "2026-10-05"},
+		{ID: "DEMO-CAP-104", Amount: 0.00, Status: "DECLINED", Currency: "USD", Date: "2026-10-10"},
 	}
 }
 
@@ -262,7 +317,7 @@ func calculateSpendIntelligence(records []PaymentRecord) SpendSummary {
 		if r.Status == "COMPLETED" {
 			total += r.Amount
 			count++
-		} else {
+		} else if r.Status == "DECLINED" || r.Status == "FAILED" {
 			failed++
 		}
 	}
@@ -304,8 +359,4 @@ Return a 1-sentence actionable insight, max 15 words.`, summary.TotalCaptured, s
 		return "AI insight unavailable."
 	}
 	return strings.TrimSpace(result.Choices[0].Message.Content)
-}
-
-func getMockSubscriptionsJSON() string {
-	return `[{"merchant":"Netflix","category":"Video","annual_cost":191.88,"evidence":"Monthly (Charged 4 times)","recommendation":"Review plan","data_source":"Synthetic Demo"}]`
 }
