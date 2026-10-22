@@ -32,7 +32,6 @@ type SpendSummary struct {
 	AIInsight     string  `json:"ai_insight"`
 }
 
-// Struct to parse PayPal API errors
 type PayPalError struct {
 	Name    string `json:"name"`
 	Message string `json:"message"`
@@ -43,10 +42,20 @@ type PayPalError struct {
 	DebugID string `json:"debug_id"`
 }
 
+// --- Global In-Memory Store ---
 var (
 	recordsLock     sync.Mutex
 	capturedRecords []PaymentRecord
 )
+
+// --- Middleware to fix PayPal Popup Spinner ---
+func coopMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// This allows the PayPal login popup to open and navigate correctly
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
+		next.ServeHTTP(w, r)
+	})
+}
 
 func main() {
 	_ = godotenv.Load()
@@ -54,15 +63,20 @@ func main() {
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
 	groqKey := os.Getenv("GROQ_API_KEY")
 
-	fs := http.FileServer(http.Dir("./static"))
-	http.Handle("/", fs)
+	// Create a custom mux so we can apply middleware
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+	// Serve static files
+	fs := http.FileServer(http.Dir("./static"))
+	mux.Handle("/", fs)
+
+	// API Routes
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"clientId": clientID})
 	})
 
-	http.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -89,7 +103,7 @@ func main() {
 		})
 	})
 
-	http.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -132,7 +146,7 @@ func main() {
 		json.NewEncoder(w).Encode(payment)
 	})
 
-	http.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
 
@@ -148,7 +162,7 @@ func main() {
 		json.NewEncoder(w).Encode(summary)
 	})
 
-	http.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
@@ -164,7 +178,11 @@ func main() {
 		port = "8080"
 	}
 	fmt.Println("🚀 Server starting on port " + port)
-	http.ListenAndServe(":"+port, nil)
+
+	// Apply the COOP middleware to the entire mux
+	if err := http.ListenAndServe(":"+port, coopMiddleware(mux)); err != nil {
+		fmt.Println("Server error:", err)
+	}
 }
 
 func sendJSONError(w http.ResponseWriter, msg string, code int) {
