@@ -94,7 +94,8 @@
             const config = await res.json();
 
             const script = document.createElement('script');
-            script.src = `https://www.paypal.com/sdk/js?client-id=${config.clientId}&currency=USD`;
+            // FIX: Added &buyer-country=US to resolve HTTP 400 error for international sandbox testing
+            script.src = `https://www.paypal.com/sdk/js?client-id=${config.clientId}&currency=USD&buyer-country=US`;
             script.onload = renderPayPalButton;
             document.head.appendChild(script);
         }
