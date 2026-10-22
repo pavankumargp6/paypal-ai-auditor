@@ -13,7 +13,7 @@
         .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
         .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
-        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
+        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 500px; }
         .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
         
         .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; transition: 0.2s; }
@@ -29,11 +29,11 @@
 
     <div class="summary-grid">
         <div class="card">
-            <div class="card-title">Live Captured Revenue</div>
+            <div class="card-title">Sandbox Captured Revenue</div>
             <div class="card-value" id="total-revenue">$0.00</div>
         </div>
         <div class="card">
-            <div class="card-title">Successful Live Payments</div>
+            <div class="card-title">Successful Sandbox Payments</div>
             <div class="card-value" id="total-success">0</div>
         </div>
         <div class="card">
@@ -58,17 +58,24 @@
         document.addEventListener('DOMContentLoaded', () => {
             spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
                 columnDefs: [
-                    { field: "id", headerName: "Capture ID", flex: 1 },
+                    { field: "id", headerName: "Capture ID", flex: 2 },
                     { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + p.value.toFixed(2) },
-                    { field: "status", headerName: "Status", flex: 1 },
-                    { field: "date", headerName: "Date", flex: 1 },
-                    // FIX 3: Visually distinguish real vs demo data
-                    { field: "is_live", headerName: "Source", flex: 1, 
+                    { field: "status", headerName: "Status", flex: 1, 
+                      cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
+                    },
+                    { field: "date", headerName: "Timestamp", flex: 2 },
+                    { field: "is_live", headerName: "Source", flex: 2, 
                       valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
                       cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
+                    },
+                    // FIX 3: Transaction Detail View
+                    { headerName: "Details", flex: 2, 
+                      valueGetter: p => `${p.data.id} | $${p.data.amount.toFixed(2)} | ${p.data.status} | ${p.data.date} | ${p.data.is_live ? 'Live' : 'Demo'}`,
+                      cellStyle: { 'fontSize': '0.85rem', 'color': '#64748b' }
                     }
                 ],
-                rowData: []
+                rowData: [],
+                defaultColDef: { resizable: true }
             });
 
             refreshDashboard();

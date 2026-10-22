@@ -36,10 +36,14 @@ type SpendSummary struct {
 var (
 	recordsLock     sync.Mutex
 	capturedRecords []PaymentRecord
+	dataFile        = "captures.json"
 )
 
 func main() {
 	_ = godotenv.Load()
+	// Load existing records from disk (survives restarts)
+	loadRecords()
+
 	clientID := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_SECRET"))
 	groqKey := strings.TrimSpace(os.Getenv("GROQ_API_KEY"))
@@ -98,7 +102,7 @@ func main() {
 			return
 		}
 
-		// FIX 4: Verify order is actually APPROVED before capturing
+		// Verify order is actually APPROVED
 		isApproved, err := verifyPayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil || !isApproved {
 			sendJSONError(w, "Order is not approved by buyer yet.", http.StatusBadRequest)
@@ -111,7 +115,7 @@ func main() {
 			return
 		}
 
-		// FIX 2: Duplicate Protection
+		// Duplicate Protection
 		recordsLock.Lock()
 		for _, existing := range capturedRecords {
 			if existing.ID == payment.ID {
@@ -121,6 +125,7 @@ func main() {
 			}
 		}
 		capturedRecords = append(capturedRecords, payment)
+		saveRecords() // Persist to disk
 		recordsLock.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -132,13 +137,10 @@ func main() {
 		defer cancel()
 
 		recordsLock.Lock()
-		// FIX 3: Separate real records from demo records for accurate math
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
 
-		// Add demo records (marked as IsLive: false)
 		allRecords = append(allRecords, getMockSpendRecords()...)
-
 		summary := calculateSpendIntelligence(allRecords)
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
 
@@ -150,7 +152,6 @@ func main() {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
-
 		allRecords = append(allRecords, getMockSpendRecords()...)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -165,11 +166,26 @@ func main() {
 	http.ListenAndServe(":"+port, mux)
 }
 
+// --- Persistence Helpers ---
+func loadRecords() {
+	file, err := os.ReadFile(dataFile)
+	if err == nil {
+		json.Unmarshal(file, &capturedRecords)
+	}
+}
+
+func saveRecords() {
+	// Note: Must be called while recordsLock is held
+	data, _ := json.MarshalIndent(capturedRecords, "", "  ")
+	os.WriteFile(dataFile, data, 0644)
+}
+
 func sendJSONError(w http.ResponseWriter, msg string, code int) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// --- PayPal API Helpers ---
 func getPayPalToken(ctx context.Context, clientID, secret string) (string, error) {
 	apiURL := "https://api-m.sandbox.paypal.com/v1/oauth2/token"
 	data := url.Values{}
@@ -242,7 +258,6 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 			break
 		}
 	}
-
 	return result.ID, approveURL, nil
 }
 
@@ -268,7 +283,6 @@ func verifyPayPalOrder(ctx context.Context, token, orderID string) (bool, error)
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// FIX 1 & 4: Ensure order is approved before capturing
 	return result.Status == "APPROVED", nil
 }
 
@@ -314,7 +328,6 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 
 	capture := paypalResult.PurchaseUnits[0].Payments.Captures[0]
 
-	// FIX 1: Verify the individual capture status is COMPLETED
 	if capture.Status != "COMPLETED" {
 		return PaymentRecord{}, fmt.Errorf("capture status is %s, expected COMPLETED", capture.Status)
 	}
@@ -328,7 +341,7 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 		Status:   capture.Status,
 		Currency: capture.Amount.CurrencyCode,
 		Date:     time.Now().Format(time.RFC3339),
-		IsLive:   true, // Mark as real PayPal data
+		IsLive:   true,
 	}, nil
 }
 
@@ -344,7 +357,6 @@ func calculateSpendIntelligence(records []PaymentRecord) SpendSummary {
 	var total float64
 	var count, failed int
 	for _, r := range records {
-		// FIX 3: Only sum REAL (IsLive) captured revenue for the top KPI
 		if r.IsLive && r.Status == "COMPLETED" {
 			total += r.Amount
 			count++
@@ -360,9 +372,13 @@ func calculateSpendIntelligence(records []PaymentRecord) SpendSummary {
 }
 
 func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	prompt := fmt.Sprintf(`You are a merchant AI copilot. Summarize this spend data for a dashboard:
-Total Captured Live Revenue: $%.2f across %d successful payments. Failed payments: %d.
-Return a 1-sentence actionable insight, max 15 words.`, summary.TotalCaptured, summary.TotalCount, summary.FailedCount)
+	// FIX 2: Force AI to use evidence and distinguish failures
+	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze this exact payment data:
+Live Captured Revenue: $%.2f
+Successful Payments: %d
+Failed Payments: %d
+
+Based ONLY on these numbers, provide a 1-sentence actionable insight. If there are failures, suggest improving checkout. If there are successes and no failures, suggest retaining customers. Max 20 words.`, summary.TotalCaptured, summary.TotalCount, summary.FailedCount)
 
 	payload := map[string]interface{}{"model": "openai/gpt-oss-20b", "messages": []map[string]string{{"role": "user", "content": prompt}}}
 	jsonPayload, _ := json.Marshal(payload)
