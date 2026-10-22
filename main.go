@@ -32,9 +32,17 @@ type SpendSummary struct {
 	AIInsight     string  `json:"ai_insight"`
 }
 
-// --- Global In-Memory Store (Development Only) ---
-// NOTE: In a real production app, this would be a PostgreSQL database.
-// Render's free tier will wipe this data on restart.
+// Struct to parse PayPal API errors
+type PayPalError struct {
+	Name    string `json:"name"`
+	Message string `json:"message"`
+	Details []struct {
+		Issue       string `json:"issue"`
+		Description string `json:"description"`
+	} `json:"details"`
+	DebugID string `json:"debug_id"`
+}
+
 var (
 	recordsLock     sync.Mutex
 	capturedRecords []PaymentRecord
@@ -49,13 +57,11 @@ func main() {
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/", fs)
 
-	// 0. Config endpoint for frontend to get the Client ID
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"clientId": clientID})
 	})
 
-	// 1. Create Order
 	http.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -83,7 +89,6 @@ func main() {
 		})
 	})
 
-	// 2. Capture Order (Only called after buyer approves)
 	http.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -108,16 +113,17 @@ func main() {
 
 		payment, err := capturePayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil {
-			// Catch the specific ORDER_NOT_APPROVED error
-			if strings.Contains(err.Error(), "ORDER_NOT_APPROVED") {
-				sendJSONError(w, "Buyer has not approved the order yet.", http.StatusBadRequest)
-				return
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "ORDER_NOT_APPROVED") {
+				sendJSONError(w, "PayPal says the order is not approved yet. Please complete the login flow.", http.StatusBadRequest)
+			} else if strings.Contains(errMsg, "ORDER_ALREADY_CAPTURED") {
+				sendJSONError(w, "This order has already been captured.", http.StatusBadRequest)
+			} else {
+				sendJSONError(w, "PayPal Error: "+errMsg, http.StatusInternalServerError)
 			}
-			sendJSONError(w, "Capture failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		// Persist to memory (safely)
 		recordsLock.Lock()
 		capturedRecords = append(capturedRecords, payment)
 		recordsLock.Unlock()
@@ -126,7 +132,6 @@ func main() {
 		json.NewEncoder(w).Encode(payment)
 	})
 
-	// 3. Spend Intelligence (Combines real captures + demo data)
 	http.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
@@ -135,9 +140,7 @@ func main() {
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
 
-		// Add demo data so the dashboard always has content
 		allRecords = append(allRecords, getMockSpendRecords()...)
-
 		summary := calculateSpendIntelligence(allRecords)
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
 
@@ -145,7 +148,6 @@ func main() {
 		json.NewEncoder(w).Encode(summary)
 	})
 
-	// 4. Get transaction list for the grid
 	http.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
@@ -169,8 +171,6 @@ func sendJSONError(w http.ResponseWriter, msg string, code int) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
-
-// --- PayPal API Helpers ---
 
 func getPayPalToken(ctx context.Context, clientID, secret string) (string, error) {
 	apiURL := "https://api-m.sandbox.paypal.com/v1/oauth2/token"
@@ -262,7 +262,14 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return PaymentRecord{}, fmt.Errorf("%s", string(body))
+		var paypalErr PayPalError
+		if err := json.Unmarshal(body, &paypalErr); err == nil {
+			if len(paypalErr.Details) > 0 {
+				return PaymentRecord{}, fmt.Errorf("%s: %s", paypalErr.Details[0].Issue, paypalErr.Details[0].Description)
+			}
+			return PaymentRecord{}, fmt.Errorf("%s: %s", paypalErr.Name, paypalErr.Message)
+		}
+		return PaymentRecord{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var paypalResult struct {
@@ -299,8 +306,6 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 		Date:     time.Now().Format(time.RFC3339),
 	}, nil
 }
-
-// --- Spend Intelligence Engine ---
 
 func getMockSpendRecords() []PaymentRecord {
 	return []PaymentRecord{
