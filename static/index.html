@@ -19,6 +19,7 @@
 </head>
 <body>
     <h1>🤖 AI Subscription Auditor</h1>
+    <p style="color: #d93025; font-weight: bold; margin-bottom: 20px;" id="data-source-badge">Checking data source...</p>
     <p class="subtitle">Deterministic transaction analysis, enriched by AI.</p>
     
     <div class="summary-cards">
@@ -55,13 +56,15 @@
         document.addEventListener('DOMContentLoaded', () => {
             const gridDiv = document.querySelector('#myGrid');
             const gridApi = agGrid.createGrid(gridDiv, gridOptions);
-
             fetch('/api/analyze')
                 .then(response => response.json())
                 .then(data => {
                     document.getElementById('loading-text').style.display = 'none';
                     
-                    // Calculate Summary
+                    if (data.length > 0) {
+                        document.getElementById('data-source-badge').innerText = "Data Source: " + data[0].data_source;
+                    }
+
                     let totalCost = 0;
                     data.forEach(item => totalCost += (item.annual_cost || 0));
                     
@@ -69,8 +72,7 @@
                     document.getElementById('total-subs').innerText = data.length;
                     
                     gridApi.setGridOption('rowData', data);
-                })
-                .catch(error => {
+                })                .catch(error => {
                     document.getElementById('loading-text').innerText = '❌ Failed to load data.';
                     console.error('Error:', error);
                 });

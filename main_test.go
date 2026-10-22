@@ -57,7 +57,7 @@ func TestFindRecurringSubscriptions(t *testing.T) {
 
 func TestEnrichAndValidateAI_Empty(t *testing.T) {
 	// If no recurring subs, it should safely return an empty array
-	res := enrichAndValidateAI(context.Background(), []RecurringSub{}, "fake_key")
+	res := enrichAndValidateAI(context.Background(), []RecurringSub{}, "fake_key", "Test Source")
 	if res == nil {
 		t.Error("Expected empty array, got nil")
 	}
