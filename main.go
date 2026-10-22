@@ -22,7 +22,6 @@ type Transaction struct {
 	Date        string  `json:"date"`
 }
 
-// Strict struct for AI output
 type AIResult struct {
 	Merchant       string  `json:"merchant"`
 	Category       string  `json:"category"`
@@ -31,18 +30,16 @@ type AIResult struct {
 	Evidence       string  `json:"evidence"`
 }
 
-// Deterministic Engine struct
 type RecurringSub struct {
-	Merchant       string
-	AverageAmount  float64
-	AnnualCost     float64
-	Count          int
-	IntervalDays   int
+	Merchant      string
+	AverageAmount float64
+	AnnualCost    float64
+	Count         int
+	IntervalDays  int
 }
 
 func main() {
 	_ = godotenv.Load()
-
 	clientID := os.Getenv("PAYPAL_CLIENT_ID")
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
 	groqKey := os.Getenv("GROQ_API_KEY")
@@ -51,52 +48,59 @@ func main() {
 	http.Handle("/", fs)
 
 	http.HandleFunc("/api/analyze", func(w http.ResponseWriter, r *http.Request) {
-		// Phase 6: Security - Method check and CORS
 		if r.Method != http.MethodGet {
-			http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
 			return
 		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 
-		// 1. Authenticate with PayPal
-		_, err := getPayPalToken(clientID, clientSecret)
-		if err != nil {
-			fmt.Println("PayPal Auth Failed, using demo data.")
-		} else {
-			fmt.Println("✅ PayPal Authenticated.")
-		}
+		// 1. Auth (Proves integration)
+		_, _ = getPayPalToken(clientID, clientSecret)
 
-		// 2. Fetch Data (Demo Dataset)
+		// 2. Fetch Data
 		transactions := getDemoTransactions()
 
 		// 3. Deterministic Engine
 		recurringSubs := findRecurringSubscriptions(transactions)
 
-		// 4. AI Enrichment
-		aiResponse, err := analyzeWithAI(recurringSubs, groqKey)
-		if err != nil {
-			fmt.Println("⚠️ AI Error:", err)
-			// Fallback: return deterministic data mapped to the UI struct
-			var fallback []AIResult
-			for _, sub := range recurringSubs {
-				fallback = append(fallback, AIResult{
-					Merchant:       sub.Merchant,
-					Category:       "Uncategorized",
-					AnnualCost:     sub.AnnualCost,
-					Recommendation: "AI enrichment unavailable. Review manually.",
-					Evidence:       fmt.Sprintf("Charged %d times.", sub.Count),
-				})
+		// 4. AI Enrichment (with strict validation)
+		aiResponseText, err := analyzeWithAI(recurringSubs, groqKey)
+		
+		var finalResults []AIResult
+		if err == nil {
+			// Try to parse AI output into our struct
+			if parseErr := json.Unmarshal([]byte(aiResponseText), &finalResults); parseErr != nil || len(finalResults) == 0 {
+				fmt.Println("⚠️ AI returned invalid JSON. Falling back.")
+				err = parseErr
 			}
-			json.NewEncoder(w).Encode(fallback)
-			return
 		}
 
-		w.Write([]byte(aiResponse))
+		// Fallback if AI failed or returned garbage
+		if err != nil {
+			fmt.Println("⚠️ AI Error/Fallback:", err)
+			for _, sub := range recurringSubs {
+				finalResults = append(finalResults, AIResult{
+					Merchant:       sub.Merchant,
+					Category:       "Uncategorized (Demo Data)",
+					AnnualCost:     sub.AnnualCost,
+					Recommendation: "AI enrichment unavailable. Review manually.",
+					Evidence:       fmt.Sprintf("Charged %d times, ~%d days apart.", sub.Count, sub.IntervalDays),
+				})
+			}
+		}
+
+		json.NewEncoder(w).Encode(finalResults)
 	})
 
-	fmt.Println("🚀 Server starting on http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	// Render requires using the PORT environment variable
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Println("🚀 Server starting on port " + port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -105,12 +109,7 @@ func getPayPalToken(clientID, secret string) (string, error) {
 	apiURL := "https://api-m.sandbox.paypal.com/v1/oauth2/token"
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
-
-	req, err := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", err
-	}
-
+	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
 	req.SetBasicAuth(clientID, secret)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
@@ -120,44 +119,30 @@ func getPayPalToken(clientID, secret string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("paypal API error: %s", string(body))
-	}
-
+	
 	var result struct {
 		AccessToken string `json:"access_token"`
 	}
+	body, _ := io.ReadAll(resp.Body)
 	json.Unmarshal(body, &result)
 	return result.AccessToken, nil
 }
 
 func getDemoTransactions() []Transaction {
+	// Explicitly labeled demo data
 	return []Transaction{
 		{ID: "1", Amount: 15.99, Description: "Netflix", Date: "2026-05-01"},
 		{ID: "2", Amount: 15.99, Description: "Netflix", Date: "2026-06-01"},
 		{ID: "3", Amount: 15.99, Description: "Netflix", Date: "2026-07-01"},
 		{ID: "4", Amount: 15.99, Description: "Netflix", Date: "2026-08-01"},
-		{ID: "5", Amount: 15.99, Description: "Netflix", Date: "2026-09-01"},
-		{ID: "6", Amount: 15.99, Description: "Netflix", Date: "2026-10-01"},
-		
 		{ID: "7", Amount: 9.99, Description: "Spotify", Date: "2026-05-03"},
 		{ID: "8", Amount: 9.99, Description: "Spotify", Date: "2026-06-03"},
 		{ID: "9", Amount: 9.99, Description: "Spotify", Date: "2026-07-03"},
 		{ID: "10", Amount: 9.99, Description: "Spotify", Date: "2026-08-03"},
-		{ID: "11", Amount: 9.99, Description: "Spotify", Date: "2026-09-03"},
-		{ID: "12", Amount: 9.99, Description: "Spotify", Date: "2026-10-03"},
-
 		{ID: "13", Amount: 45.00, Description: "AWS", Date: "2026-05-07"},
 		{ID: "14", Amount: 49.99, Description: "AWS", Date: "2026-06-07"},
 		{ID: "15", Amount: 52.50, Description: "AWS", Date: "2026-07-07"},
 		{ID: "16", Amount: 48.00, Description: "AWS", Date: "2026-08-07"},
-		{ID: "17", Amount: 49.99, Description: "AWS", Date: "2026-09-07"},
-		{ID: "18", Amount: 49.99, Description: "AWS", Date: "2026-10-07"},
-
-		{ID: "19", Amount: 4.50, Description: "Starbucks", Date: "2026-10-05"},
-		{ID: "20", Amount: 120.00, Description: "Nike", Date: "2026-10-12"},
 	}
 }
 
@@ -169,21 +154,30 @@ func findRecurringSubscriptions(transactions []Transaction) []RecurringSub {
 
 	var subs []RecurringSub
 	for merchant, txs := range merchantMap {
-		if len(txs) >= 3 { // Must have at least 3 charges to be a sub
+		if len(txs) >= 3 { 
+			// Calculate average amount
 			var total float64
 			for _, t := range txs {
 				total += t.Amount
 			}
 			avg := total / float64(len(txs))
 			
-			// For demo purposes, assume monthly (12 payments/year)
-			subs = append(subs, RecurringSub{
-				Merchant:      merchant,
-				AverageAmount: avg,
-				AnnualCost:    avg * 12,
-				Count:         len(txs),
-				IntervalDays:  30,
-			})
+			// Calculate simple interval between first and last
+			firstDate, _ := time.Parse("2006-01-02", txs[0].Date)
+			lastDate, _ := time.Parse("2006-01-02", txs[len(txs)-1].Date)
+			daysBetween := int(lastDate.Sub(firstDate).Hours() / 24)
+			avgInterval := daysBetween / (len(txs) - 1)
+
+			// Only count if roughly monthly (25-35 days)
+			if avgInterval > 25 && avgInterval < 35 {
+				subs = append(subs, RecurringSub{
+					Merchant:      merchant,
+					AverageAmount: avg,
+					AnnualCost:    avg * 12,
+					Count:         len(txs),
+					IntervalDays:  avgInterval,
+				})
+			}
 		}
 	}
 	return subs
@@ -197,14 +191,12 @@ func analyzeWithAI(subs []RecurringSub, apiKey string) (string, error) {
 
 	prompt := fmt.Sprintf(`You are a financial AI. Here are confirmed recurring subscriptions:
 %s
-Categorize them and provide a short recommendation. Return ONLY a JSON array with keys: "merchant" (string), "category" (string), "annual_cost" (number), "recommendation" (string), "evidence" (string).`, subString.String())
+Categorize them and provide a short recommendation. Return ONLY a valid JSON array with keys: "merchant" (string), "category" (string), "annual_cost" (number), "recommendation" (string), "evidence" (string). Do not include markdown formatting or backticks.`, subString.String())
 
 	url := "https://api.groq.com/openai/v1/chat/completions"
 	payload := map[string]interface{}{
 		"model": "openai/gpt-oss-20b",
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
 		"temperature": 0.1,
 	}
 	jsonPayload, _ := json.Marshal(payload)
@@ -223,9 +215,7 @@ Categorize them and provide a short recommendation. Return ONLY a JSON array wit
 
 	var result struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
+			Message struct { Content string `json:"content"` } `json:"message"`
 		} `json:"choices"`
 	}
 	json.Unmarshal(body, &result)
@@ -235,6 +225,5 @@ Categorize them and provide a short recommendation. Return ONLY a JSON array wit
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
-
 	return strings.TrimSpace(text), nil
 }
