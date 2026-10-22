@@ -39,23 +39,12 @@ type PayPalError struct {
 		Issue       string `json:"issue"`
 		Description string `json:"description"`
 	} `json:"details"`
-	DebugID string `json:"debug_id"`
 }
 
-// --- Global In-Memory Store ---
 var (
 	recordsLock     sync.Mutex
 	capturedRecords []PaymentRecord
 )
-
-// --- Middleware to fix PayPal Popup Spinner ---
-func coopMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// This allows the PayPal login popup to open and navigate correctly
-		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
-		next.ServeHTTP(w, r)
-	})
-}
 
 func main() {
 	_ = godotenv.Load()
@@ -63,19 +52,11 @@ func main() {
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
 	groqKey := os.Getenv("GROQ_API_KEY")
 
-	// Create a custom mux so we can apply middleware
 	mux := http.NewServeMux()
-
-	// Serve static files
 	fs := http.FileServer(http.Dir("./static"))
 	mux.Handle("/", fs)
 
-	// API Routes
-	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"clientId": clientID})
-	})
-
+	// 1. Create Order (with return_url for redirect flow)
 	mux.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -90,7 +71,9 @@ func main() {
 			return
 		}
 
-		orderID, approveURL, err := createPayPalOrder(ctx, token)
+		// We tell PayPal to redirect back to our app after approval
+		returnURL := "https://paypal-ai-auditor.onrender.com/?success=true"
+		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL)
 		if err != nil {
 			sendJSONError(w, "Failed to create order: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -103,6 +86,7 @@ func main() {
 		})
 	})
 
+	// 2. Capture Order
 	mux.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -127,14 +111,7 @@ func main() {
 
 		payment, err := capturePayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil {
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "ORDER_NOT_APPROVED") {
-				sendJSONError(w, "PayPal says the order is not approved yet. Please complete the login flow.", http.StatusBadRequest)
-			} else if strings.Contains(errMsg, "ORDER_ALREADY_CAPTURED") {
-				sendJSONError(w, "This order has already been captured.", http.StatusBadRequest)
-			} else {
-				sendJSONError(w, "PayPal Error: "+errMsg, http.StatusInternalServerError)
-			}
+			sendJSONError(w, "PayPal Error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -146,6 +123,7 @@ func main() {
 		json.NewEncoder(w).Encode(payment)
 	})
 
+	// 3. Spend Intelligence
 	mux.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
@@ -153,8 +131,8 @@ func main() {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
-
 		allRecords = append(allRecords, getMockSpendRecords()...)
+
 		summary := calculateSpendIntelligence(allRecords)
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
 
@@ -162,11 +140,11 @@ func main() {
 		json.NewEncoder(w).Encode(summary)
 	})
 
+	// 4. Transactions
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
 		recordsLock.Unlock()
-
 		allRecords = append(allRecords, getMockSpendRecords()...)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -178,11 +156,7 @@ func main() {
 		port = "8080"
 	}
 	fmt.Println("🚀 Server starting on port " + port)
-
-	// Apply the COOP middleware to the entire mux
-	if err := http.ListenAndServe(":"+port, coopMiddleware(mux)); err != nil {
-		fmt.Println("Server error:", err)
-	}
+	http.ListenAndServe(":"+port, mux)
 }
 
 func sendJSONError(w http.ResponseWriter, msg string, code int) {
@@ -217,11 +191,15 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 	return result.AccessToken, nil
 }
 
-func createPayPalOrder(ctx context.Context, token string) (string, string, error) {
+func createPayPalOrder(ctx context.Context, token, returnURL string) (string, string, error) {
 	payload := map[string]interface{}{
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]interface{}{
 			{"amount": map[string]string{"currency_code": "USD", "value": "25.00"}},
+		},
+		"application_context": map[string]string{
+			"return_url": returnURL,
+			"cancel_url": "https://paypal-ai-auditor.onrender.com/?cancel=true",
 		},
 	}
 	jsonPayload, _ := json.Marshal(payload)
@@ -252,14 +230,10 @@ func createPayPalOrder(ctx context.Context, token string) (string, string, error
 
 	var approveURL string
 	for _, link := range result.Links {
-		if link.Rel == "approve" {
+		if link.Rel == "approve" || link.Rel == "payer-action" {
 			approveURL = link.Href
 			break
 		}
-	}
-
-	if approveURL == "" {
-		return "", "", fmt.Errorf("no approve link found")
 	}
 
 	return result.ID, approveURL, nil
@@ -280,14 +254,7 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		var paypalErr PayPalError
-		if err := json.Unmarshal(body, &paypalErr); err == nil {
-			if len(paypalErr.Details) > 0 {
-				return PaymentRecord{}, fmt.Errorf("%s: %s", paypalErr.Details[0].Issue, paypalErr.Details[0].Description)
-			}
-			return PaymentRecord{}, fmt.Errorf("%s: %s", paypalErr.Name, paypalErr.Message)
-		}
-		return PaymentRecord{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return PaymentRecord{}, fmt.Errorf("capture failed: %s", string(body))
 	}
 
 	var paypalResult struct {

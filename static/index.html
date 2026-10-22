@@ -8,15 +8,28 @@
         body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 40px; background: #f4f7f9; color: #1e293b; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
         .header h1 { margin: 0; font-size: 2rem; color: #0f172a; }
-        
         .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
         .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
-        
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
         .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
         .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
+        
+        .paypal-btn {
+            background-color: #ffc439;
+            color: #003087;
+            border: none;
+            border-radius: 4px;
+            padding: 12px 30px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            font-style: italic;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        .paypal-btn:hover { background-color: #f2ba36; }
+        .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -43,10 +56,10 @@
     <div class="checkout-area">
         <div>
             <h3 style="margin:0 0 5px 0;">Real PayPal Sandbox Checkout</h3>
-            <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button below, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
+            <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
         </div>
-        <!-- Official PayPal Button Container -->
-        <div id="paypal-button-container"></div>
+        <!-- Custom Redirect Button -->
+        <button class="paypal-btn" id="paypal-btn" onclick="startCheckout()">PayPal</button>
     </div>
 
     <div class="grid-container" id="spendGrid" class="ag-theme-quartz"></div>
@@ -54,7 +67,6 @@
     <script>
         let spendGridApi;
 
-        // Initialize AG Grid
         document.addEventListener('DOMContentLoaded', () => {
             spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
                 columnDefs: [
@@ -67,10 +79,14 @@
             });
 
             refreshDashboard();
-            loadPayPalSDK();
+
+            // Check if we just returned from a PayPal redirect
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.has('success') && urlParams.has('token')) {
+                captureOrder(urlParams.get('token'));
+            }
         });
 
-        // Fetch Stats & Transactions
         function refreshDashboard() {
             fetch('/api/spend-intelligence')
                 .then(res => res.json())
@@ -88,61 +104,50 @@
                 });
         }
 
-        // Load PayPal SDK dynamically with Client ID from backend
-        async function loadPayPalSDK() {
-            const res = await fetch('/api/config');
-            const config = await res.json();
+        // 1. Start Checkout (Redirect)
+        async function startCheckout() {
+            const btn = document.getElementById('paypal-btn');
+            btn.disabled = true;
+            btn.innerText = "Redirecting...";
 
-            const script = document.createElement('script');
-            // Removed &buyer-country=US to fix the 400 error
-            script.src = `https://www.paypal.com/sdk/js?client-id=${config.clientId}&currency=USD`;
-            script.onload = renderPayPalButton;
-            document.head.appendChild(script);
+            try {
+                const res = await fetch('/api/create-order', { method: 'POST' });
+                const data = await res.json();
+                if (data.error) throw new Error(data.error);
+                
+                // Redirect the whole browser to PayPal
+                window.location.href = data.approveURL;
+            } catch (err) {
+                alert("Error: " + err.message);
+                btn.disabled = false;
+                btn.innerText = "PayPal";
+            }
         }
 
-        // Render the Official PayPal Button
-        function renderPayPalButton() {
-            paypal.Buttons({
-                // 1. Create Order
-                createOrder: async () => {
-                    const res = await fetch('/api/create-order', { method: 'POST' });
-                    const data = await res.json();
-                    if (data.error) { alert(data.error); throw new Error(data.error); }
-                    return data.id; 
-                },
-                // 2. Capture Order (Only runs after user logs in and approves)
-                onApprove: async (data) => {
-                    try {
-                        const res = await fetch('/api/capture-order', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ orderID: data.orderID })
-                        });
-                        
-                        let payment;
-                        try {
-                            payment = await res.json();
-                        } catch (e) {
-                            throw new Error("Server returned an invalid response.");
-                        }
-
-                        if (!res.ok || payment.error) {
-                            throw new Error(payment.error || "Unknown capture error");
-                        }
-                        
-                        alert(`✅ Payment Captured! ID: ${payment.id} for $${payment.amount}`);
-                        refreshDashboard(); 
-                        
-                    } catch (err) {
-                        console.error(err);
-                        alert("Checkout Error: " + err.message);
-                    }
-                },
-                onError: (err) => {
-                    console.error(err);
-                    alert("PayPal Checkout Error. Check the console.");
-                }
-            }).render('#paypal-button-container');
+        // 2. Capture Order (After redirecting back)
+        async function captureOrder(orderID) {
+            document.getElementById('ai-insight').innerText = "🤖 Capturing payment...";
+            try {
+                const res = await fetch('/api/capture-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ orderID: orderID })
+                });
+                
+                const payment = await res.json();
+                if (!res.ok || payment.error) throw new Error(payment.error || "Unknown error");
+                
+                alert(`✅ Payment Captured! ID: ${payment.id} for $${payment.amount}`);
+                
+                // Clean the URL so it doesn't capture twice on refresh
+                window.history.replaceState({}, document.title, "/");
+                refreshDashboard();
+                
+            } catch (err) {
+                alert("Capture Error: " + err.message);
+                window.history.replaceState({}, document.title, "/");
+                refreshDashboard();
+            }
         }
     </script>
 </body>
