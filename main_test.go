@@ -26,16 +26,32 @@ func resp(status int, body string) *http.Response {
 
 // Endpoint-aware mock: distinguishes GET (verify/reconcile) from POST (capture).
 func mockEndpoints(verifyBody, captureBody, reconcileBody string) {
+	getCount := 0
+
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		// Mock PayPal OAuth token generation.
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token","token_type":"Bearer"}`), nil
+		}
+
+		// Mock PayPal capture.
 		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/capture") {
 			return resp(http.StatusOK, captureBody), nil
 		}
 
-		// GET is used by both verifyOrderStatus and reconcileCapture.
-		if reconcileBody != "" {
+		// The first order GET verifies the order status.
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/v2/checkout/orders/") {
+			getCount++
+
+			if getCount == 1 || reconcileBody == "" {
+				return resp(http.StatusOK, verifyBody), nil
+			}
+
+			// A subsequent GET retrieves the completed capture for reconciliation.
 			return resp(http.StatusOK, reconcileBody), nil
 		}
-		return resp(http.StatusOK, verifyBody), nil
+
+		return resp(http.StatusNotFound, `{"error":"unexpected mock request"}`), nil
 	})
 }
 
