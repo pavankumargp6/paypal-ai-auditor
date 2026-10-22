@@ -26,7 +26,7 @@ func main() {
 	_ = godotenv.Load()
 	clientID := os.Getenv("PAYPAL_CLIENT_ID")
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
-	geminiKey := os.Getenv("GEMINI_API_KEY")
+	groqKey := os.Getenv("GROQ_API_KEY")
 
 	// 1. Serve the frontend HTML
 	fs := http.FileServer(http.Dir("./static"))
@@ -47,8 +47,7 @@ func main() {
 		transactions := getMockTransactions()
 
 		// Call the AI
-		aiResponse, err := analyzeWithAI(transactions, geminiKey)
-		
+		aiResponse, err := analyzeWithAI(transactions, groqKey)		
 		// FALLBACK: If Gemini is down (503) or fails, use mock data instantly so the UI works
 		if err != nil {
 			fmt.Println("⚠️ AI Error. Using high-quality fallback data.")
@@ -114,6 +113,7 @@ func getMockTransactions() []Transaction {
 }
 
 func analyzeWithAI(transactions []Transaction, apiKey string) (string, error) {
+	// Convert transactions to a string format for the prompt
 	var txString strings.Builder
 	for _, t := range transactions {
 		txString.WriteString(fmt.Sprintf("- %s: $%.2f on %s\n", t.Description, t.Amount, t.Date))
@@ -121,19 +121,29 @@ func analyzeWithAI(transactions []Transaction, apiKey string) (string, error) {
 
 	prompt := fmt.Sprintf(`You are a personal finance AI. Analyze these recent PayPal transactions:
 %s
-Identify which ones are recurring subscriptions. Categorize them (e.g., Entertainment, Software) and provide a brief recommendation on which ones the user should review or cancel to save money. Return ONLY a valid JSON array with keys: "merchant", "category", "amount" (number), and "recommendation". Do not include markdown formatting.`, txString.String())
+Identify which ones are recurring subscriptions. Categorize them (e.g., Entertainment, Software) and provide a brief recommendation on which ones the user should review or cancel to save money. Return ONLY a valid JSON array with keys: "merchant", "category", "amount" (number), and "recommendation". Do not include markdown formatting or backticks.`, txString.String())
 
-	// We are using Gemini 3.8 Flash as requested by the API error
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=%s", apiKey)
+	// Groq API uses the OpenAI-compatible endpoint
+	url := "https://api.groq.com/openai/v1/chat/completions"
+	
 	payload := map[string]interface{}{
-		"contents": []map[string]interface{}{
-			{"parts": []map[string]string{{"text": prompt}}},
+		"model": "llama3-8b-8192", // Fast and free model
+		"messages": []map[string]string{
+			{"role": "user", "content": prompt},
 		},
+		"temperature": 0.1, // Keep it focused on the data
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	// We only try ONCE now so the UI doesn't hang for 30 seconds
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -141,26 +151,25 @@ Identify which ones are recurring subscriptions. Categorize them (e.g., Entertai
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("gemini error: %s", string(body))
+		return "", fmt.Errorf("groq error: %s", string(body))
 	}
 
+	// Parse Groq's response
 	var result struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
 
 	err = json.Unmarshal(body, &result)
-	if err != nil || len(result.Candidates) == 0 {
+	if err != nil || len(result.Choices) == 0 {
 		return "", fmt.Errorf("failed to parse AI response")
 	}
 
-	// Clean up the response in case Gemini adds markdown formatting (like ```json)
-	text := result.Candidates[0].Content.Parts[0].Text
+	// Clean up any accidental markdown formatting
+	text := result.Choices[0].Message.Content
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
 	text = strings.TrimSuffix(text, "```")
