@@ -606,6 +606,16 @@ Provide a 1-sentence actionable insight based ONLY on the live captured data. Ma
 	return strings.TrimSpace(result.Choices[0].Message.Content)
 }
 
+func validatePayment(p PaymentRecord) error {
+	if p.Currency != expectedCurrency {
+		return fmt.Errorf("invalid currency: expected %s, got %s", expectedCurrency, p.Currency)
+	}
+	if math.Abs(p.Amount-expectedAmount) > 0.001 {
+		return fmt.Errorf("invalid amount: expected %.2f, got %.2f", expectedAmount, p.Amount)
+	}
+	return nil
+}
+
 func sendJSONError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)

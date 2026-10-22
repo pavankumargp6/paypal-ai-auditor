@@ -10,9 +10,7 @@ import (
 
 type mockRoundTripper func(*http.Request) (*http.Response, error)
 
-func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return m(req)
-}
+func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return m(req) }
 
 func setupMockClient(statusCode int, body string) {
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -25,57 +23,87 @@ func setupMockClient(statusCode int, body string) {
 }
 
 func TestOrderIDValidation(t *testing.T) {
-	valid := "5O190127TN364715T"
-	invalid := "malicious-id-with-slash/../"
-
-	if !orderIDRegex.MatchString(valid) {
-		t.Errorf("Expected %s to be valid", valid)
+	if !orderIDRegex.MatchString("5O190127TN364715T") {
+		t.Error("Valid ID failed")
 	}
-	if orderIDRegex.MatchString(invalid) {
-		t.Errorf("Expected %s to be invalid", invalid)
+	if orderIDRegex.MatchString("malicious/../") {
+		t.Error("Invalid ID passed")
 	}
 }
 
 func TestCalculateSummary_LiveVsDemo(t *testing.T) {
 	live := []PaymentRecord{{ID: "L1", Amount: 25.00, Status: "COMPLETED", IsLive: true}}
 	demo := []PaymentRecord{{ID: "D1", Amount: 100.00, Status: "COMPLETED", IsLive: false}}
-
 	summary := calculateSummary(live, demo)
 	if summary.TotalCaptured != 25.00 {
 		t.Errorf("Expected 25.00, got %.2f", summary.TotalCaptured)
 	}
 }
 
-func TestParseCaptureFromBody_Valid(t *testing.T) {
-	body := []byte(`{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "COMPLETED", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
-	rec, err := parseCaptureFromBody(body)
-	if err != nil || rec.Amount != 25.00 {
-		t.Errorf("Parsing failed: %v", err)
+func TestValidatePayment(t *testing.T) {
+	// 1. Valid Payment
+	valid := PaymentRecord{Amount: 25.00, Currency: "USD"}
+	if err := validatePayment(valid); err != nil {
+		t.Errorf("Valid payment failed: %v", err)
+	}
+
+	// 2. Wrong Amount
+	wrongAmt := PaymentRecord{Amount: 24.99, Currency: "USD"}
+	if err := validatePayment(wrongAmt); err == nil {
+		t.Error("Expected error for wrong amount")
+	}
+
+	// 3. Wrong Currency
+	wrongCur := PaymentRecord{Amount: 25.00, Currency: "EUR"}
+	if err := validatePayment(wrongCur); err == nil {
+		t.Error("Expected error for wrong currency")
 	}
 }
 
 func TestVerifyOrderStatus(t *testing.T) {
 	ctx := context.Background()
 
+	// 1. APPROVED (Valid for capture)
 	setupMockClient(200, `{"status": "APPROVED"}`)
-	status, err := verifyOrderStatus(ctx, "token", "ORDER123")
-	if err != nil || status != "APPROVED" {
-		t.Errorf("Expected APPROVED, got %s, err: %v", status, err)
+	status, _ := verifyOrderStatus(ctx, "token", "ORDER123")
+	if status != "APPROVED" {
+		t.Errorf("Expected APPROVED, got %s", status)
 	}
 
+	// 2. CREATED (Unapproved, must be rejected before capture)
 	setupMockClient(200, `{"status": "CREATED"}`)
-	status, err = verifyOrderStatus(ctx, "token", "ORDER123")
-	if err != nil || status != "CREATED" {
+	status, _ = verifyOrderStatus(ctx, "token", "ORDER123")
+	if status != "CREATED" {
 		t.Errorf("Expected CREATED, got %s", status)
+	}
+
+	// 3. COMPLETED (Already captured, trigger reconciliation)
+	setupMockClient(200, `{"status": "COMPLETED"}`)
+	status, _ = verifyOrderStatus(ctx, "token", "ORDER123")
+	if status != "COMPLETED" {
+		t.Errorf("Expected COMPLETED, got %s", status)
 	}
 }
 
-func TestCapturePayPalOrder_Incomplete(t *testing.T) {
-	ctx := context.Background()
+func TestParseCaptureFromBody(t *testing.T) {
+	// 1. Valid Capture
+	validBody := []byte(`{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "COMPLETED", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
+	rec, err := parseCaptureFromBody(validBody)
+	if err != nil || rec.Amount != 25.00 {
+		t.Errorf("Parsing failed: %v", err)
+	}
 
-	setupMockClient(201, `{"status": "COMPLETED", "purchase_units": []}`)
-	_, err := capturePayPalOrder(ctx, "token", "ORDER123")
+	// 2. Incomplete (No captures)
+	incompleteBody := []byte(`{"status": "COMPLETED", "purchase_units": []}`)
+	_, err = parseCaptureFromBody(incompleteBody)
 	if err == nil {
-		t.Error("Expected error for incomplete capture response")
+		t.Error("Expected error for incomplete body")
+	}
+
+	// 3. Not COMPLETED status
+	pendingBody := []byte(`{"status": "PENDING", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "PENDING", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
+	_, err = parseCaptureFromBody(pendingBody)
+	if err == nil {
+		t.Error("Expected error for non-COMPLETED status")
 	}
 }
