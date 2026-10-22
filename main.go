@@ -30,7 +30,6 @@ var (
 	httpClient   = &http.Client{Timeout: 15 * time.Second}
 	orderIDRegex = regexp.MustCompile(`^[A-Z0-9]{1,50}$`)
 
-	// Abstracted as a variable so it can be mocked in handler tests
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
 		_, err := db.ExecContext(ctx, `INSERT INTO captures (id, amount, status, currency, date, is_live)
 			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
@@ -82,7 +81,7 @@ func main() {
 	clientSecret := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_SECRET"))
 	groqKey := strings.TrimSpace(os.Getenv("GROQ_API_KEY"))
 	if clientID == "" || clientSecret == "" {
-		log.Fatal("PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET are required")
+		log.Fatal("PayPal credentials required")
 	}
 
 	mux := http.NewServeMux()
@@ -115,8 +114,7 @@ func initDB(dbURL string) error {
 	}
 	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS captures (
 		id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL, 
-		currency TEXT NOT NULL, date TEXT NOT NULL, is_live BOOLEAN NOT NULL
-	)`)
+		currency TEXT NOT NULL, date TEXT NOT NULL, is_live BOOLEAN NOT NULL)`)
 	return err
 }
 
@@ -128,13 +126,11 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
-
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
 			sendJSONError(w, "PayPal auth failed", 502)
 			return
 		}
-
 		returnURL := "https://paypal-ai-auditor.onrender.com/?success=true"
 		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL)
 		if err != nil {
@@ -145,7 +141,6 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			sendJSONError(w, "Missing approval link", 502)
 			return
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"id": orderID, "approveURL": approveURL})
 	}
@@ -171,7 +166,6 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
-
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
 			sendJSONError(w, "PayPal auth failed", 502)
@@ -180,16 +174,17 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		status, err := verifyOrderStatus(ctx, token, reqBody.OrderID)
 		if err != nil {
-			sendJSONError(w, "Failed to verify order status", 502)
+			sendJSONError(w, "Failed to verify order: "+err.Error(), 502)
 			return
 		}
 
 		var payment PaymentRecord
-		if status == "COMPLETED" {
+		switch status {
+		case "COMPLETED":
 			payment, err = reconcileCapture(ctx, token, reqBody.OrderID)
-		} else if status == "APPROVED" {
+		case "APPROVED":
 			payment, err = capturePayPalOrder(ctx, token, reqBody.OrderID)
-		} else {
+		default:
 			sendJSONError(w, fmt.Sprintf("Order status is %s. Must be APPROVED.", status), 400)
 			return
 		}
@@ -198,21 +193,20 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			return
 		}
 
-		// 1. Validate Amount/Currency
 		if err := validatePayment(payment); err != nil {
 			log.Printf("CRITICAL: payment validation failed: %v", err)
 			sendJSONError(w, err.Error(), 502)
 			return
 		}
 
-		// 2. Persist to DB
 		if err := persistCapture(ctx, payment); err != nil {
 			correlationID := fmt.Sprintf("cap-%d", time.Now().UnixNano())
 			log.Printf("[%s] CRITICAL: capture succeeded but persistence failed: %v", correlationID, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"status": "capture_succeeded_persistence_pending", "capture_id": payment.ID, "amount": payment.Amount, "correlation_id": correlationID,
+				"status":     "capture_succeeded_persistence_pending",
+				"capture_id": payment.ID, "amount": payment.Amount, "correlation_id": correlationID,
 			})
 			return
 		}
@@ -231,10 +225,8 @@ func makeSpendHandler(groqKey string) http.HandlerFunc {
 			sendJSONError(w, "DB query failed", 500)
 			return
 		}
-
 		summary := calculateSummary(liveRecords, getDemoRecords())
 		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(summary)
 	}
@@ -249,7 +241,6 @@ func makeTransactionsHandler() http.HandlerFunc {
 			sendJSONError(w, "DB query failed", 500)
 			return
 		}
-
 		all := append(liveRecords, getDemoRecords()...)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(all)
@@ -274,8 +265,7 @@ func getLiveRecords(ctx context.Context) ([]PaymentRecord, error) {
 }
 
 func getPayPalToken(ctx context.Context, clientID, secret string) (string, error) {
-	data := strings.NewReader("grant_type=client_credentials")
-	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api-m.sandbox.paypal.com/v1/oauth2/token", data)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api-m.sandbox.paypal.com/v1/oauth2/token", strings.NewReader("grant_type=client_credentials"))
 	req.SetBasicAuth(clientID, secret)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := httpClient.Do(req)
@@ -290,7 +280,9 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 	var result struct {
 		AccessToken string `json:"access_token"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("decode token: %w", err)
+	}
 	return result.AccessToken, nil
 }
 
@@ -320,7 +312,9 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 			Rel  string `json:"rel"`
 		} `json:"links"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", "", fmt.Errorf("decode order: %w", err)
+	}
 	var approveURL string
 	for _, link := range result.Links {
 		if link.Rel == "approve" || link.Rel == "payer-action" {
@@ -331,6 +325,7 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 	return result.ID, approveURL, nil
 }
 
+// FIX: Return error on JSON decode failure
 func verifyOrderStatus(ctx context.Context, token, orderID string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s", orderID), nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -341,12 +336,14 @@ func verifyOrderStatus(ctx context.Context, token, orderID string) (string, erro
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 	var result struct {
 		Status string `json:"status"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("malformed status response: %w", err)
+	}
 	return result.Status, nil
 }
 
@@ -361,7 +358,7 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return PaymentRecord{}, fmt.Errorf("status %d", resp.StatusCode)
+		return PaymentRecord{}, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 	return parseCaptureFromBody(body)
 }
@@ -376,11 +373,12 @@ func reconcileCapture(ctx context.Context, token, orderID string) (PaymentRecord
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return PaymentRecord{}, fmt.Errorf("status %d", resp.StatusCode)
+		return PaymentRecord{}, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 	return parseCaptureFromBody(body)
 }
 
+// FIX: Return error on JSON decode failure
 func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
 	var result struct {
 		Status        string `json:"status"`
@@ -397,15 +395,26 @@ func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
 			} `json:"payments"`
 		} `json:"purchase_units"`
 	}
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return PaymentRecord{}, fmt.Errorf("malformed capture response: %w", err)
+	}
 	if len(result.PurchaseUnits) == 0 || len(result.PurchaseUnits[0].Payments.Captures) == 0 {
-		return PaymentRecord{}, fmt.Errorf("no captures")
+		return PaymentRecord{}, fmt.Errorf("no captures in response")
 	}
 	capture := result.PurchaseUnits[0].Payments.Captures[0]
-	if capture.Status != "COMPLETED" {
-		return PaymentRecord{}, fmt.Errorf("status %s", capture.Status)
+	if capture.ID == "" {
+		return PaymentRecord{}, fmt.Errorf("empty capture ID")
 	}
-	amt, _ := strconv.ParseFloat(capture.Amount.Value, 64)
+	if capture.Status != "COMPLETED" {
+		return PaymentRecord{}, fmt.Errorf("capture status %s, expected COMPLETED", capture.Status)
+	}
+	amt, err := strconv.ParseFloat(capture.Amount.Value, 64)
+	if err != nil {
+		return PaymentRecord{}, fmt.Errorf("parse amount %q: %w", capture.Amount.Value, err)
+	}
+	if capture.Amount.CurrencyCode == "" {
+		return PaymentRecord{}, fmt.Errorf("empty currency")
+	}
 	return PaymentRecord{ID: capture.ID, Amount: amt, Status: capture.Status, Currency: capture.Amount.CurrencyCode, Date: time.Now().UTC().Format(time.RFC3339), IsLive: true}, nil
 }
 
@@ -435,7 +444,7 @@ func calculateSummary(live, demo []PaymentRecord) SpendSummary {
 }
 
 func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%.2f (%d payments), Demo Completed %d. Decline rate NOT TRACKED. Give a 1-sentence actionable insight. Max 20 words.`, summary.TotalCaptured, summary.LiveSuccess, summary.DemoCompletedCount)
+	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%.2f (%d payments), Demo %d. Decline rate NOT TRACKED. Give 1-sentence actionable insight. Max 20 words.`, summary.TotalCaptured, summary.LiveSuccess, summary.DemoCompletedCount)
 	payload := map[string]interface{}{"model": "openai/gpt-oss-20b", "messages": []map[string]string{{"role": "user", "content": prompt}}, "temperature": 0.1}
 	jsonPayload, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(jsonPayload))
