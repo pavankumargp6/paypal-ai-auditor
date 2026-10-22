@@ -16,7 +16,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// --- Structs ---
 type PaymentRecord struct {
 	ID       string  `json:"id"`
 	Amount   float64 `json:"amount"`
@@ -32,15 +31,6 @@ type SpendSummary struct {
 	AIInsight     string  `json:"ai_insight"`
 }
 
-type PayPalError struct {
-	Name    string `json:"name"`
-	Message string `json:"message"`
-	Details []struct {
-		Issue       string `json:"issue"`
-		Description string `json:"description"`
-	} `json:"details"`
-}
-
 var (
 	recordsLock     sync.Mutex
 	capturedRecords []PaymentRecord
@@ -48,15 +38,15 @@ var (
 
 func main() {
 	_ = godotenv.Load()
-	clientID := os.Getenv("PAYPAL_CLIENT_ID")
-	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
-	groqKey := os.Getenv("GROQ_API_KEY")
+	// Trim spaces to prevent invisible formatting errors
+	clientID := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_ID"))
+	clientSecret := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_SECRET"))
+	groqKey := strings.TrimSpace(os.Getenv("GROQ_API_KEY"))
 
 	mux := http.NewServeMux()
 	fs := http.FileServer(http.Dir("./static"))
 	mux.Handle("/", fs)
 
-	// 1. Create Order (with return_url for redirect flow)
 	mux.HandleFunc("/api/create-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -67,15 +57,14 @@ func main() {
 
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
-			sendJSONError(w, "PayPal auth failed", http.StatusUnauthorized)
+			sendJSONError(w, "Auth Error: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
 
-		// We tell PayPal to redirect back to our app after approval
 		returnURL := "https://paypal-ai-auditor.onrender.com/?success=true"
 		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL)
 		if err != nil {
-			sendJSONError(w, "Failed to create order: "+err.Error(), http.StatusInternalServerError)
+			sendJSONError(w, "Order Error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -86,7 +75,6 @@ func main() {
 		})
 	})
 
-	// 2. Capture Order
 	mux.HandleFunc("/api/capture-order", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -105,13 +93,13 @@ func main() {
 
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
-			sendJSONError(w, "PayPal auth failed", http.StatusUnauthorized)
+			sendJSONError(w, "Auth Error: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
 
 		payment, err := capturePayPalOrder(ctx, token, reqBody.OrderID)
 		if err != nil {
-			sendJSONError(w, "PayPal Error: "+err.Error(), http.StatusInternalServerError)
+			sendJSONError(w, "Capture Error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -123,7 +111,6 @@ func main() {
 		json.NewEncoder(w).Encode(payment)
 	})
 
-	// 3. Spend Intelligence
 	mux.HandleFunc("/api/spend-intelligence", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
@@ -140,7 +127,6 @@ func main() {
 		json.NewEncoder(w).Encode(summary)
 	})
 
-	// 4. Transactions
 	mux.HandleFunc("/api/transactions", func(w http.ResponseWriter, r *http.Request) {
 		recordsLock.Lock()
 		allRecords := append([]PaymentRecord{}, capturedRecords...)
@@ -180,7 +166,8 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("auth failed with status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
