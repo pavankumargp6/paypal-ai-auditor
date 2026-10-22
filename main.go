@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,20 +24,26 @@ type Transaction struct {
 	Date        string  `json:"date"`
 }
 
-type AIResult struct {
-	Merchant       string  `json:"merchant"`
-	Category       string  `json:"category"`
-	AnnualCost     float64 `json:"annual_cost"`
-	Recommendation string  `json:"recommendation"`
-	Evidence       string  `json:"evidence"`
-}
-
 type RecurringSub struct {
 	Merchant      string
 	AverageAmount float64
 	AnnualCost    float64
 	Count         int
-	IntervalDays  int
+}
+
+type AIResult struct {
+	Merchant       string `json:"merchant"`
+	Category       string `json:"category"`
+	Recommendation string `json:"recommendation"`
+	Evidence       string `json:"evidence"`
+}
+
+type FinalResult struct {
+	Merchant       string  `json:"merchant"`
+	Category       string  `json:"category"`
+	AnnualCost     float64 `json:"annual_cost"`
+	Recommendation string  `json:"recommendation"`
+	Evidence       string  `json:"evidence"`
 }
 
 func main() {
@@ -49,52 +57,43 @@ func main() {
 
 	http.HandleFunc("/api/analyze", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 
-		// 1. Auth (Proves integration)
-		_, _ = getPayPalToken(clientID, clientSecret)
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+
+		// 1. Auth (Proves integration, but we are using demo data for the hackathon)
+		_, err := getPayPalToken(ctx, clientID, clientSecret)
+		if err != nil {
+			log.Println("⚠️ PayPal Auth failed, proceeding with labeled demo data.")
+		} else {
+			log.Println("✅ PayPal Authenticated (Demo Data mode active).")
+		}
 
 		// 2. Fetch Data
 		transactions := getDemoTransactions()
 
 		// 3. Deterministic Engine
-		recurringSubs := findRecurringSubscriptions(transactions)
-
-		// 4. AI Enrichment (with strict validation)
-		aiResponseText, err := analyzeWithAI(recurringSubs, groqKey)
-		
-		var finalResults []AIResult
-		if err == nil {
-			// Try to parse AI output into our struct
-			if parseErr := json.Unmarshal([]byte(aiResponseText), &finalResults); parseErr != nil || len(finalResults) == 0 {
-				fmt.Println("⚠️ AI returned invalid JSON. Falling back.")
-				err = parseErr
-			}
-		}
-
-		// Fallback if AI failed or returned garbage
+		recurringSubs, err := findRecurringSubscriptions(transactions)
 		if err != nil {
-			fmt.Println("⚠️ AI Error/Fallback:", err)
-			for _, sub := range recurringSubs {
-				finalResults = append(finalResults, AIResult{
-					Merchant:       sub.Merchant,
-					Category:       "Uncategorized (Demo Data)",
-					AnnualCost:     sub.AnnualCost,
-					Recommendation: "AI enrichment unavailable. Review manually.",
-					Evidence:       fmt.Sprintf("Charged %d times, ~%d days apart.", sub.Count, sub.IntervalDays),
-				})
-			}
+			sendJSONError(w, "Error analyzing transactions", http.StatusInternalServerError)
+			return
 		}
 
+		if len(recurringSubs) == 0 {
+			w.Write([]byte("[]"))
+			return
+		}
+
+		// 4. AI Enrichment & Validation
+		finalResults := enrichAndValidateAI(ctx, recurringSubs, groqKey)
 		json.NewEncoder(w).Encode(finalResults)
 	})
 
-	// Render requires using the PORT environment variable
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -105,125 +104,195 @@ func main() {
 	}
 }
 
-func getPayPalToken(clientID, secret string) (string, error) {
+func sendJSONError(w http.ResponseWriter, msg string, code int) {
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func getPayPalToken(ctx context.Context, clientID, secret string) (string, error) {
 	apiURL := "https://api-m.sandbox.paypal.com/v1/oauth2/token"
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
-	req, _ := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
+
+	req, _ := http.NewRequestWithContext(ctx, "POST", apiURL, strings.NewReader(data.Encode()))
 	req.SetBasicAuth(clientID, secret)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("auth failed")
+	}
+
 	var result struct {
 		AccessToken string `json:"access_token"`
 	}
 	body, _ := io.ReadAll(resp.Body)
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
 	return result.AccessToken, nil
 }
 
 func getDemoTransactions() []Transaction {
-	// Explicitly labeled demo data
+	// Explicitly labeled synthetic demo data to ensure safe, reproducible testing
 	return []Transaction{
 		{ID: "1", Amount: 15.99, Description: "Netflix", Date: "2026-05-01"},
 		{ID: "2", Amount: 15.99, Description: "Netflix", Date: "2026-06-01"},
 		{ID: "3", Amount: 15.99, Description: "Netflix", Date: "2026-07-01"},
 		{ID: "4", Amount: 15.99, Description: "Netflix", Date: "2026-08-01"},
+
 		{ID: "7", Amount: 9.99, Description: "Spotify", Date: "2026-05-03"},
 		{ID: "8", Amount: 9.99, Description: "Spotify", Date: "2026-06-03"},
 		{ID: "9", Amount: 9.99, Description: "Spotify", Date: "2026-07-03"},
 		{ID: "10", Amount: 9.99, Description: "Spotify", Date: "2026-08-03"},
+
+		// Irregular AWS (Should be flagged correctly or filtered depending on interval)
 		{ID: "13", Amount: 45.00, Description: "AWS", Date: "2026-05-07"},
 		{ID: "14", Amount: 49.99, Description: "AWS", Date: "2026-06-07"},
 		{ID: "15", Amount: 52.50, Description: "AWS", Date: "2026-07-07"},
 		{ID: "16", Amount: 48.00, Description: "AWS", Date: "2026-08-07"},
+
+		{ID: "20", Amount: 120.00, Description: "Nike", Date: "2026-10-12"}, // One-off
 	}
 }
 
-func findRecurringSubscriptions(transactions []Transaction) []RecurringSub {
+func findRecurringSubscriptions(transactions []Transaction) ([]RecurringSub, error) {
 	merchantMap := make(map[string][]Transaction)
+
+	// Normalize merchant names and group
 	for _, t := range transactions {
-		merchantMap[t.Description] = append(merchantMap[t.Description], t)
+		normName := strings.Title(strings.ToLower(strings.TrimSpace(t.Description)))
+		merchantMap[normName] = append(merchantMap[normName], t)
 	}
 
 	var subs []RecurringSub
 	for merchant, txs := range merchantMap {
-		if len(txs) >= 3 { 
-			// Calculate average amount
+		if len(txs) < 3 {
+			continue
+		}
+
+		// Sort by date
+		sort.Slice(txs, func(i, j int) bool {
+			return txs[i].Date < txs[j].Date
+		})
+
+		isMonthly := true
+		for i := 1; i < len(txs); i++ {
+			t1, err1 := time.Parse("2006-01-02", txs[i-1].Date)
+			t2, err2 := time.Parse("2006-01-02", txs[i].Date)
+			if err1 != nil || err2 != nil {
+				isMonthly = false
+				break
+			}
+
+			days := int(t2.Sub(t1).Hours() / 24)
+			// Allow 25-35 days for monthly tolerance
+			if days < 25 || days > 35 {
+				isMonthly = false
+				break
+			}
+		}
+
+		if isMonthly {
 			var total float64
 			for _, t := range txs {
 				total += t.Amount
 			}
 			avg := total / float64(len(txs))
-			
-			// Calculate simple interval between first and last
-			firstDate, _ := time.Parse("2006-01-02", txs[0].Date)
-			lastDate, _ := time.Parse("2006-01-02", txs[len(txs)-1].Date)
-			daysBetween := int(lastDate.Sub(firstDate).Hours() / 24)
-			avgInterval := daysBetween / (len(txs) - 1)
-
-			// Only count if roughly monthly (25-35 days)
-			if avgInterval > 25 && avgInterval < 35 {
-				subs = append(subs, RecurringSub{
-					Merchant:      merchant,
-					AverageAmount: avg,
-					AnnualCost:    avg * 12,
-					Count:         len(txs),
-					IntervalDays:  avgInterval,
-				})
-			}
+			subs = append(subs, RecurringSub{
+				Merchant:      merchant,
+				AverageAmount: avg,
+				AnnualCost:    avg * 12,
+				Count:         len(txs),
+			})
 		}
 	}
-	return subs
+	return subs, nil
 }
 
-func analyzeWithAI(subs []RecurringSub, apiKey string) (string, error) {
-	var subString strings.Builder
+func enrichAndValidateAI(ctx context.Context, subs []RecurringSub, apiKey string) []FinalResult {
+	// 1. Prepare fallback
+	var finalResults []FinalResult
+	subMap := make(map[string]RecurringSub)
 	for _, s := range subs {
-		subString.WriteString(fmt.Sprintf("- %s: $%.2f/month (Annual: $%.2f)\n", s.Merchant, s.AverageAmount, s.AnnualCost))
+		subMap[strings.ToLower(s.Merchant)] = s
 	}
 
-	prompt := fmt.Sprintf(`You are a financial AI. Here are confirmed recurring subscriptions:
-%s
-Categorize them and provide a short recommendation. Return ONLY a valid JSON array with keys: "merchant" (string), "category" (string), "annual_cost" (number), "recommendation" (string), "evidence" (string). Do not include markdown formatting or backticks.`, subString.String())
+	// 2. Call AI
+	var subString strings.Builder
+	for _, s := range subs {
+		subString.WriteString(fmt.Sprintf("- %s: $%.2f/month\n", s.Merchant, s.AverageAmount))
+	}
 
-	url := "https://api.groq.com/openai/v1/chat/completions"
+	prompt := fmt.Sprintf(`Here are confirmed subscriptions: %s. Categorize them and provide a recommendation. Return ONLY JSON array with keys: "merchant", "category", "recommendation", "evidence".`, subString.String())
+
 	payload := map[string]interface{}{
-		"model": "openai/gpt-oss-20b",
+		"model":    "openai/gpt-oss-20b",
 		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"temperature": 0.1,
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.groq.com/openai/v1/chat/completions", bytes.NewBuffer(jsonPayload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := client.Do(req)
-	if err != nil { return "", err }
-	defer resp.Body.Close()
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var groqResp struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(body, &groqResp) == nil && len(groqResp.Choices) > 0 {
+			text := groqResp.Choices[0].Message.Content
+			text = strings.TrimPrefix(text, "```json")
+			text = strings.TrimPrefix(text, "```")
+			text = strings.TrimSuffix(text, "```")
 
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 { return "", fmt.Errorf("groq error: %s", string(body)) }
-
-	var result struct {
-		Choices []struct {
-			Message struct { Content string `json:"content"` } `json:"message"`
-		} `json:"choices"`
+			var aiResults []AIResult
+			if json.Unmarshal([]byte(text), &aiResults) == nil {
+				// 3. Validate AI Output
+				for _, ai := range aiResults {
+					normMerchant := strings.ToLower(ai.Merchant)
+					if sub, exists := subMap[normMerchant]; exists {
+						finalResults = append(finalResults, FinalResult{
+							Merchant:       sub.Merchant, // Use deterministic name
+							Category:       ai.Category,
+							AnnualCost:     sub.AnnualCost, // Use deterministic cost
+							Recommendation: ai.Recommendation,
+							Evidence:       ai.Evidence,
+						})
+						delete(subMap, normMerchant) // Mark as processed
+					}
+				}
+			}
+		}
 	}
-	json.Unmarshal(body, &result)
-	if len(result.Choices) == 0 { return "", fmt.Errorf("empty response") }
 
-	text := result.Choices[0].Message.Content
-	text = strings.TrimPrefix(text, "```json")
-	text = strings.TrimPrefix(text, "```")
-	text = strings.TrimSuffix(text, "```")
-	return strings.TrimSpace(text), nil
+	// 4. Add any remaining subs that AI missed or if AI failed completely
+	for _, sub := range subMap {
+		finalResults = append(finalResults, FinalResult{
+			Merchant:       sub.Merchant,
+			Category:       "Uncategorized",
+			AnnualCost:     sub.AnnualCost,
+			Recommendation: "AI analysis unavailable for this item.",
+			Evidence:       fmt.Sprintf("Charged %d times.", sub.Count),
+		})
+	}
+
+	if finalResults == nil {
+		return []FinalResult{}
+	}
+	return finalResults
 }
