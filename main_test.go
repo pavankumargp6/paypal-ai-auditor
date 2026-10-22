@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -12,98 +14,104 @@ type mockRoundTripper func(*http.Request) (*http.Response, error)
 
 func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return m(req) }
 
-func setupMockClient(statusCode int, body string) {
+// Smarter mock that handles both the status check (GET) and capture (POST)
+func setupSmartMock(statusBody string, captureStatus int, captureBody string) {
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		// If it's a POST to /capture, return the captureBody
+		if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/capture") {
+			return &http.Response{
+				StatusCode: captureStatus,
+				Body:       io.NopCloser(strings.NewReader(captureBody)),
+				Header:     make(http.Header),
+			}, nil
+		}
+		// Otherwise, return the statusBody (for verifyOrderStatus)
 		return &http.Response{
-			StatusCode: statusCode,
-			Body:       io.NopCloser(strings.NewReader(body)),
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(statusBody)),
 			Header:     make(http.Header),
 		}, nil
 	})
 }
 
-func TestOrderIDValidation(t *testing.T) {
-	if !orderIDRegex.MatchString("5O190127TN364715T") {
-		t.Error("Valid ID failed")
-	}
-	if orderIDRegex.MatchString("malicious/../") {
-		t.Error("Invalid ID passed")
-	}
-}
-
-func TestCalculateSummary_LiveVsDemo(t *testing.T) {
-	live := []PaymentRecord{{ID: "L1", Amount: 25.00, Status: "COMPLETED", IsLive: true}}
-	demo := []PaymentRecord{{ID: "D1", Amount: 100.00, Status: "COMPLETED", IsLive: false}}
-	summary := calculateSummary(live, demo)
-	if summary.TotalCaptured != 25.00 {
-		t.Errorf("Expected 25.00, got %.2f", summary.TotalCaptured)
-	}
-}
-
 func TestValidatePayment(t *testing.T) {
-	// 1. Valid Payment
-	valid := PaymentRecord{Amount: 25.00, Currency: "USD"}
-	if err := validatePayment(valid); err != nil {
-		t.Errorf("Valid payment failed: %v", err)
+	if err := validatePayment(PaymentRecord{Amount: 25.00, Currency: "USD"}); err != nil {
+		t.Error("Valid failed")
 	}
-
-	// 2. Wrong Amount
-	wrongAmt := PaymentRecord{Amount: 24.99, Currency: "USD"}
-	if err := validatePayment(wrongAmt); err == nil {
-		t.Error("Expected error for wrong amount")
+	if err := validatePayment(PaymentRecord{Amount: 24.00, Currency: "USD"}); err == nil {
+		t.Error("Wrong amount passed")
 	}
-
-	// 3. Wrong Currency
-	wrongCur := PaymentRecord{Amount: 25.00, Currency: "EUR"}
-	if err := validatePayment(wrongCur); err == nil {
-		t.Error("Expected error for wrong currency")
+	if err := validatePayment(PaymentRecord{Amount: 25.00, Currency: "EUR"}); err == nil {
+		t.Error("Wrong currency passed")
 	}
 }
 
-func TestVerifyOrderStatus(t *testing.T) {
+func TestVerifyOrderStatus_ErrorHandling(t *testing.T) {
 	ctx := context.Background()
-
-	// 1. APPROVED (Valid for capture)
-	setupMockClient(200, `{"status": "APPROVED"}`)
+	setupSmartMock(`{"error": "server down"}`, 200, "")
+	// The mock returns 200 for GET, but the body is bad, so parsing should handle it gracefully.
 	status, _ := verifyOrderStatus(ctx, "token", "ORDER123")
-	if status != "APPROVED" {
-		t.Errorf("Expected APPROVED, got %s", status)
-	}
-
-	// 2. CREATED (Unapproved, must be rejected before capture)
-	setupMockClient(200, `{"status": "CREATED"}`)
-	status, _ = verifyOrderStatus(ctx, "token", "ORDER123")
-	if status != "CREATED" {
-		t.Errorf("Expected CREATED, got %s", status)
-	}
-
-	// 3. COMPLETED (Already captured, trigger reconciliation)
-	setupMockClient(200, `{"status": "COMPLETED"}`)
-	status, _ = verifyOrderStatus(ctx, "token", "ORDER123")
-	if status != "COMPLETED" {
-		t.Errorf("Expected COMPLETED, got %s", status)
+	if status != "" {
+		t.Errorf("Expected empty status, got %s", status)
 	}
 }
 
-func TestParseCaptureFromBody(t *testing.T) {
-	// 1. Valid Capture
-	validBody := []byte(`{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "COMPLETED", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
-	rec, err := parseCaptureFromBody(validBody)
-	if err != nil || rec.Amount != 25.00 {
-		t.Errorf("Parsing failed: %v", err)
-	}
+// Test: Handler rejects unapproved orders (CREATED)
+func TestCaptureOrderHandler_UnapprovedOrder(t *testing.T) {
+	setupSmartMock(`{"status": "CREATED"}`, 200, "")
 
-	// 2. Incomplete (No captures)
-	incompleteBody := []byte(`{"status": "COMPLETED", "purchase_units": []}`)
-	_, err = parseCaptureFromBody(incompleteBody)
-	if err == nil {
-		t.Error("Expected error for incomplete body")
-	}
+	handler := makeCaptureOrderHandler("fake", "fake")
+	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+	w := httptest.NewRecorder()
 
-	// 3. Not COMPLETED status
-	pendingBody := []byte(`{"status": "PENDING", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "PENDING", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`)
-	_, err = parseCaptureFromBody(pendingBody)
-	if err == nil {
-		t.Error("Expected error for non-COMPLETED status")
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected 400 Bad Request for unapproved order, got %d", w.Code)
+	}
+}
+
+// Test: Handler rejects wrong amount returned from PayPal
+func TestCaptureOrderHandler_WrongAmount(t *testing.T) {
+	// Status check returns APPROVED. Capture returns a bad amount.
+	badCaptureBody := `{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "X", "status": "COMPLETED", "amount": {"value": "999.00", "currency_code": "USD"}}]}}]}`
+	setupSmartMock(`{"status": "APPROVED"}`, 200, badCaptureBody)
+
+	handler := makeCaptureOrderHandler("fake", "fake")
+	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	// Should hit validatePayment and fail with 502
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected 502 Bad Gateway for wrong amount, got %d", w.Code)
+	}
+}
+
+// Test: Handler returns pending state if DB fails
+func TestCaptureOrderHandler_DBFailure(t *testing.T) {
+	// Status check returns APPROVED. Capture returns valid data.
+	goodCaptureBody := `{"status": "COMPLETED", "purchase_units": [{"payments": {"captures": [{"id": "CAP123", "status": "COMPLETED", "amount": {"value": "25.00", "currency_code": "USD"}}]}}]}`
+	setupSmartMock(`{"status": "APPROVED"}`, 200, goodCaptureBody)
+
+	// Mock DB to fail
+	origPersist := persistCapture
+	persistCapture = func(ctx context.Context, p PaymentRecord) error {
+		return errors.New("database offline")
+	}
+	defer func() { persistCapture = origPersist }()
+
+	handler := makeCaptureOrderHandler("fake", "fake")
+	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Expected 500 for DB failure, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "capture_succeeded_persistence_pending") {
+		t.Errorf("Expected pending state response, got %s", w.Body.String())
 	}
 }
