@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -21,48 +22,79 @@ type Transaction struct {
 	Date        string  `json:"date"`
 }
 
+// Strict struct for AI output
+type AIResult struct {
+	Merchant       string  `json:"merchant"`
+	Category       string  `json:"category"`
+	AnnualCost     float64 `json:"annual_cost"`
+	Recommendation string  `json:"recommendation"`
+	Evidence       string  `json:"evidence"`
+}
+
+// Deterministic Engine struct
+type RecurringSub struct {
+	Merchant       string
+	AverageAmount  float64
+	AnnualCost     float64
+	Count          int
+	IntervalDays   int
+}
+
 func main() {
-	// Load .env for local development, but don't crash if it's missing (e.g., on Render)
 	_ = godotenv.Load()
+
 	clientID := os.Getenv("PAYPAL_CLIENT_ID")
 	clientSecret := os.Getenv("PAYPAL_CLIENT_SECRET")
 	groqKey := os.Getenv("GROQ_API_KEY")
 
-	// 1. Serve the frontend HTML
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/", fs)
 
-	// 2. API Endpoint for the UI to fetch data
 	http.HandleFunc("/api/analyze", func(w http.ResponseWriter, r *http.Request) {
+		// Phase 6: Security - Method check and CORS
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error": "Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 
-		// Authenticate with PayPal (proves integration)
+		// 1. Authenticate with PayPal
 		_, err := getPayPalToken(clientID, clientSecret)
 		if err != nil {
-			http.Error(w, `{"error": "PayPal auth failed"}`, http.StatusInternalServerError)
-			return
+			fmt.Println("PayPal Auth Failed, using demo data.")
+		} else {
+			fmt.Println("✅ PayPal Authenticated.")
 		}
 
-		transactions := getMockTransactions()
+		// 2. Fetch Data (Demo Dataset)
+		transactions := getDemoTransactions()
 
-		// Call the AI
-		aiResponse, err := analyzeWithAI(transactions, groqKey)		
-		// FALLBACK: If Gemini is down (503) or fails, use mock data instantly so the UI works
+		// 3. Deterministic Engine
+		recurringSubs := findRecurringSubscriptions(transactions)
+
+		// 4. AI Enrichment
+		aiResponse, err := analyzeWithAI(recurringSubs, groqKey)
 		if err != nil {
-			fmt.Println("⚠️ AI Error. Using high-quality fallback data.")
-			aiResponse = `[
-				{"merchant": "Netflix Subscription", "category": "Entertainment", "amount": 15.99, "recommendation": "Keep if you watch often, else cancel to save $191/year."},
-				{"merchant": "Spotify Premium", "category": "Music", "amount": 9.99, "recommendation": "Keep. Standard expense for music streaming."},
-				{"merchant": "AWS Web Services", "category": "Software/Cloud", "amount": 49.99, "recommendation": "Review your EC2 instances. This is very high for a personal account."},
-				{"merchant": "Disney+ Subscription", "category": "Entertainment", "amount": 11.99, "recommendation": "Cancel. You already pay for Netflix and likely don't need both."}
-			]`
+			fmt.Println("⚠️ AI Error:", err)
+			// Fallback: return deterministic data mapped to the UI struct
+			var fallback []AIResult
+			for _, sub := range recurringSubs {
+				fallback = append(fallback, AIResult{
+					Merchant:       sub.Merchant,
+					Category:       "Uncategorized",
+					AnnualCost:     sub.AnnualCost,
+					Recommendation: "AI enrichment unavailable. Review manually.",
+					Evidence:       fmt.Sprintf("Charged %d times.", sub.Count),
+				})
+			}
+			json.NewEncoder(w).Encode(fallback)
+			return
 		}
 
 		w.Write([]byte(aiResponse))
 	})
 
-	// 3. Start Server
 	fmt.Println("🚀 Server starting on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
@@ -82,7 +114,7 @@ func getPayPalToken(clientID, secret string) (string, error) {
 	req.SetBasicAuth(clientID, secret)
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -101,60 +133,94 @@ func getPayPalToken(clientID, secret string) (string, error) {
 	return result.AccessToken, nil
 }
 
-func getMockTransactions() []Transaction {
+func getDemoTransactions() []Transaction {
 	return []Transaction{
-		{ID: "1", Amount: 15.99, Description: "Netflix Subscription", Date: "2026-10-01"},
-		{ID: "2", Amount: 9.99, Description: "Spotify Premium", Date: "2026-10-03"},
-		{ID: "3", Amount: 4.50, Description: "Starbucks Coffee", Date: "2026-10-05"},
-		{ID: "4", Amount: 49.99, Description: "AWS Web Services", Date: "2026-10-07"},
-		{ID: "5", Amount: 11.99, Description: "Disney+ Subscription", Date: "2026-10-10"},
-		{ID: "6", Amount: 120.00, Description: "Sneakers", Date: "2026-10-12"},
+		{ID: "1", Amount: 15.99, Description: "Netflix", Date: "2026-05-01"},
+		{ID: "2", Amount: 15.99, Description: "Netflix", Date: "2026-06-01"},
+		{ID: "3", Amount: 15.99, Description: "Netflix", Date: "2026-07-01"},
+		{ID: "4", Amount: 15.99, Description: "Netflix", Date: "2026-08-01"},
+		{ID: "5", Amount: 15.99, Description: "Netflix", Date: "2026-09-01"},
+		{ID: "6", Amount: 15.99, Description: "Netflix", Date: "2026-10-01"},
+		
+		{ID: "7", Amount: 9.99, Description: "Spotify", Date: "2026-05-03"},
+		{ID: "8", Amount: 9.99, Description: "Spotify", Date: "2026-06-03"},
+		{ID: "9", Amount: 9.99, Description: "Spotify", Date: "2026-07-03"},
+		{ID: "10", Amount: 9.99, Description: "Spotify", Date: "2026-08-03"},
+		{ID: "11", Amount: 9.99, Description: "Spotify", Date: "2026-09-03"},
+		{ID: "12", Amount: 9.99, Description: "Spotify", Date: "2026-10-03"},
+
+		{ID: "13", Amount: 45.00, Description: "AWS", Date: "2026-05-07"},
+		{ID: "14", Amount: 49.99, Description: "AWS", Date: "2026-06-07"},
+		{ID: "15", Amount: 52.50, Description: "AWS", Date: "2026-07-07"},
+		{ID: "16", Amount: 48.00, Description: "AWS", Date: "2026-08-07"},
+		{ID: "17", Amount: 49.99, Description: "AWS", Date: "2026-09-07"},
+		{ID: "18", Amount: 49.99, Description: "AWS", Date: "2026-10-07"},
+
+		{ID: "19", Amount: 4.50, Description: "Starbucks", Date: "2026-10-05"},
+		{ID: "20", Amount: 120.00, Description: "Nike", Date: "2026-10-12"},
 	}
 }
 
-func analyzeWithAI(transactions []Transaction, apiKey string) (string, error) {
-	// Convert transactions to a string format for the prompt
-	var txString strings.Builder
+func findRecurringSubscriptions(transactions []Transaction) []RecurringSub {
+	merchantMap := make(map[string][]Transaction)
 	for _, t := range transactions {
-		txString.WriteString(fmt.Sprintf("- %s: $%.2f on %s\n", t.Description, t.Amount, t.Date))
+		merchantMap[t.Description] = append(merchantMap[t.Description], t)
 	}
 
-	prompt := fmt.Sprintf(`You are a personal finance AI. Analyze these recent PayPal transactions:
-%s
-Identify which ones are recurring subscriptions. Categorize them (e.g., Entertainment, Software) and provide a brief recommendation on which ones the user should review or cancel to save money. Return ONLY a valid JSON array with keys: "merchant", "category", "amount" (number), and "recommendation". Do not include markdown formatting or backticks.`, txString.String())
+	var subs []RecurringSub
+	for merchant, txs := range merchantMap {
+		if len(txs) >= 3 { // Must have at least 3 charges to be a sub
+			var total float64
+			for _, t := range txs {
+				total += t.Amount
+			}
+			avg := total / float64(len(txs))
+			
+			// For demo purposes, assume monthly (12 payments/year)
+			subs = append(subs, RecurringSub{
+				Merchant:      merchant,
+				AverageAmount: avg,
+				AnnualCost:    avg * 12,
+				Count:         len(txs),
+				IntervalDays:  30,
+			})
+		}
+	}
+	return subs
+}
 
-	// Groq API uses the OpenAI-compatible endpoint
+func analyzeWithAI(subs []RecurringSub, apiKey string) (string, error) {
+	var subString strings.Builder
+	for _, s := range subs {
+		subString.WriteString(fmt.Sprintf("- %s: $%.2f/month (Annual: $%.2f)\n", s.Merchant, s.AverageAmount, s.AnnualCost))
+	}
+
+	prompt := fmt.Sprintf(`You are a financial AI. Here are confirmed recurring subscriptions:
+%s
+Categorize them and provide a short recommendation. Return ONLY a JSON array with keys: "merchant" (string), "category" (string), "annual_cost" (number), "recommendation" (string), "evidence" (string).`, subString.String())
+
 	url := "https://api.groq.com/openai/v1/chat/completions"
-	
 	payload := map[string]interface{}{
-		"model": "llama3-8b-8192", // Fast and free model
+		"model": "openai/gpt-oss-20b",
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"temperature": 0.1, // Keep it focused on the data
+		"temperature": 0.1,
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return "", err
-	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	client := &http.Client{}
 	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
+	if err != nil { return "", err }
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("groq error: %s", string(body))
-	}
+	if resp.StatusCode != 200 { return "", fmt.Errorf("groq error: %s", string(body)) }
 
-	// Parse Groq's response
 	var result struct {
 		Choices []struct {
 			Message struct {
@@ -162,13 +228,9 @@ Identify which ones are recurring subscriptions. Categorize them (e.g., Entertai
 			} `json:"message"`
 		} `json:"choices"`
 	}
+	json.Unmarshal(body, &result)
+	if len(result.Choices) == 0 { return "", fmt.Errorf("empty response") }
 
-	err = json.Unmarshal(body, &result)
-	if err != nil || len(result.Choices) == 0 {
-		return "", fmt.Errorf("failed to parse AI response")
-	}
-
-	// Clean up any accidental markdown formatting
 	text := result.Choices[0].Message.Content
 	text = strings.TrimPrefix(text, "```json")
 	text = strings.TrimPrefix(text, "```")
