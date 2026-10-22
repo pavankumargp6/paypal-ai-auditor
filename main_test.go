@@ -1,67 +1,23 @@
 package main
 
-import (
-	"context"
-	"testing"
-)
+import "testing"
 
-func TestFindRecurringSubscriptions(t *testing.T) {
-	tests := []struct {
-		name     string
-		txs      []Transaction
-		expected int
-	}{
-		{
-			name:     "Empty Input",
-			txs:      []Transaction{},
-			expected: 0,
-		},
-		{
-			name: "Irregular Purchases",
-			txs: []Transaction{
-				{Description: "Uber", Amount: 15, Date: "2026-01-01"},
-				{Description: "Uber", Amount: 15, Date: "2026-02-15"},
-				{Description: "Uber", Amount: 15, Date: "2026-04-20"},
-			},
-			expected: 0,
-		},
-		{
-			name: "Valid Monthly Recurring",
-			txs: []Transaction{
-				{Description: "Netflix", Amount: 15.99, Date: "2026-01-01"},
-				{Description: "Netflix", Amount: 15.99, Date: "2026-02-01"},
-				{Description: "Netflix", Amount: 15.99, Date: "2026-03-01"},
-			},
-			expected: 1,
-		},
-		{
-			name: "Variable Monthly Recurring",
-			txs: []Transaction{
-				{Description: "AWS", Amount: 45.00, Date: "2026-01-01"},
-				{Description: "AWS", Amount: 50.00, Date: "2026-02-01"},
-				{Description: "AWS", Amount: 48.00, Date: "2026-03-01"},
-			},
-			expected: 1,
-		},
+func TestCalculateSpendIntelligence(t *testing.T) {
+	records := []PaymentRecord{
+		{ID: "1", Amount: 25.00, Status: "COMPLETED"},
+		{ID: "2", Amount: 150.50, Status: "COMPLETED"},
+		{ID: "3", Amount: 0.00, Status: "DECLINED"},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			result, _ := findRecurringSubscriptions(tc.txs)
-			if len(result) != tc.expected {
-				t.Errorf("Expected %d subs, got %d", tc.expected, len(result))
-			}
-		})
-	}
-}
+	summary := calculateSpendIntelligence(records)
 
-func TestEnrichAndValidateAI_Empty(t *testing.T) {
-	// If no recurring subs, it should safely return an empty array
-	res := enrichAndValidateAI(context.Background(), []RecurringSub{}, "fake_key", "Test Source")
-	if res == nil {
-		t.Error("Expected empty array, got nil")
+	if summary.TotalCaptured != 175.50 {
+		t.Errorf("Expected total 175.50, got %.2f", summary.TotalCaptured)
 	}
-	if len(res) != 0 {
-		t.Errorf("Expected 0 results, got %d", len(res))
+	if summary.TotalCount != 2 {
+		t.Errorf("Expected 2 successful, got %d", summary.TotalCount)
+	}
+	if summary.FailedCount != 1 {
+		t.Errorf("Expected 1 failed, got %d", summary.FailedCount)
 	}
 }
