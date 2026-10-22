@@ -12,16 +12,14 @@
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
         .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
-        
         .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
-
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
         .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
         .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
-        
         .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
         .paypal-btn:hover { background-color: #f2ba36; }
+        .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -36,16 +34,16 @@
             <div class="card-value" id="total-revenue">$0.00</div>
         </div>
         <div class="card">
-            <div class="card-title">Live Success Rate</div>
-            <div class="card-value" id="success-rate" style="color:#10b981;">0%</div>
-        </div>
-        <div class="card">
             <div class="card-title">Live Successful Payments</div>
             <div class="card-value" id="total-success">0</div>
         </div>
         <div class="card">
-            <div class="card-title">Demo Failures (Synthetic)</div>
-            <div class="card-value" id="total-failed" style="color:#ef4444;">0</div>
+            <div class="card-title">Demo Completed (Synthetic)</div>
+            <div class="card-value" id="demo-success" style="color:#64748b;">0</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Decline Rate</div>
+            <div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div>
         </div>
     </div>
 
@@ -104,9 +102,8 @@
                 .then(data => {
                     document.getElementById('ai-insight').innerText = "🤖 " + data.ai_insight;
                     document.getElementById('total-revenue').innerText = '$' + data.total_captured.toFixed(2);
-                    document.getElementById('success-rate').innerText = data.success_rate.toFixed(1) + '%';
                     document.getElementById('total-success').innerText = data.live_success;
-                    document.getElementById('total-failed').innerText = data.live_failed;
+                    document.getElementById('demo-success').innerText = data.demo_completed_count;
                 });
 
             fetch('/api/transactions')
@@ -151,14 +148,27 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ orderID: orderID })
                 });
-                
-                const payment = await res.json();
-                if (!res.ok || payment.error) throw new Error(payment.error || "Unknown error");
-                
-                alert(`✅ Payment Captured! ID: ${payment.id} for $${payment.amount}`);
+
+                let data;
+                try {
+                    data = await res.json();
+                } catch (e) {
+                    throw new Error("Server returned invalid response");
+                }
+
+                // Handle the persistence-pending state explicitly
+                if (data.status === "capture_succeeded_persistence_pending") {
+                    alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
+                    window.history.replaceState({}, document.title, "/");
+                    return;
+                }
+
+                if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
+
+                alert(`✅ Payment Captured! ID: ${data.id} for $${data.amount}`);
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
-                
+
             } catch (err) {
                 alert("Capture Error: " + err.message);
                 window.history.replaceState({}, document.title, "/");
