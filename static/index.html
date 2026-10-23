@@ -90,16 +90,14 @@
             try {
                 const txRes = await fetch('/api/transactions');
                 if (!txRes.ok) throw new Error("HTTP " + txRes.status);
-                const txData = await txRes.json();
-                console.log("[transactions] loaded", txData.length, "rows");
-                window.allTransactions = txData;
+                window.allTransactions = await txRes.json();
                 applyFilter();
             } catch (err) {
                 console.error("[transactions] FAILED:", err);
                 document.getElementById('ai-insight').innerText = "❌ Transactions failed: " + err.message;
             }
 
-            // 2. Metrics + AI (non-critical — failure must not block the grid)
+            // 2. AI metrics (non-critical — failure must not block the grid)
             try {
                 const intelRes = await fetch('/api/spend-intelligence');
                 if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
