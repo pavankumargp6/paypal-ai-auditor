@@ -3,8 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <title>PayPal Spend Intelligence Agent</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-quartz.css">
     <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 40px; background: #f4f7f9; color: #1e293b; }
@@ -17,7 +15,8 @@
         .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
-        .grid-container { height: 400px; }
+        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
+        .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
         .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
         .paypal-btn:hover { background-color: #f2ba36; }
         .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -30,10 +29,22 @@
     </div>
 
     <div class="summary-grid">
-        <div class="card"><div class="card-title">Live Captured Revenue</div><div class="card-value" id="total-revenue">$0.00</div></div>
-        <div class="card"><div class="card-title">Live Successful Payments</div><div class="card-value" id="total-success">0</div></div>
-        <div class="card"><div class="card-title">Demo Completed (Synthetic)</div><div class="card-value" id="demo-success" style="color:#64748b;">0</div></div>
-        <div class="card"><div class="card-title">Decline Rate</div><div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div></div>
+        <div class="card">
+            <div class="card-title">Live Captured Revenue</div>
+            <div class="card-value" id="total-revenue">$0.00</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Live Successful Payments</div>
+            <div class="card-value" id="total-success">0</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Demo Completed (Synthetic)</div>
+            <div class="card-value" id="demo-success" style="color:#64748b;">0</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Decline Rate</div>
+            <div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div>
+        </div>
     </div>
 
     <div class="checkout-area">
@@ -41,7 +52,32 @@
             <h3 style="margin:0 0 5px 0;">Real PayPal Sandbox Checkout</h3>
             <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
         </div>
-        <button class="paypal-btn" id="paypal-btn" onclick="startCheckout()">PayPal</button>
+        <button class="paypal-btn" id="paypal-btn" onclick="openReviewModal()">PayPal</button>
+    </div>
+
+    <!-- Order Review Modal -->
+    <div id="order-review-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center;">
+        <div style="background:#fff; border-radius:12px; padding:30px; max-width:480px; width:90%; box-shadow:0 8px 32px rgba(0,0,0,0.2);">
+            <h2 style="margin-top:0; color:#0f172a;">Review your order</h2>
+            <table style="width:100%; border-collapse:collapse; margin-bottom:20px;">
+                <tr>
+                    <td style="padding:8px 0; color:#64748b;">Item</td>
+                    <td style="padding:8px 0; text-align:right; font-weight:600;">PayPal Spend Intelligence Agent — Sandbox Test Payment</td>
+                </tr>
+                <tr>
+                    <td style="padding:8px 0; color:#64748b;">Quantity</td>
+                    <td style="padding:8px 0; text-align:right; font-weight:600;">1</td>
+                </tr>
+                <tr style="border-top:1px solid #e2e8f0;">
+                    <td style="padding:12px 0; color:#64748b; font-weight:600;">Total</td>
+                    <td style="padding:12px 0; text-align:right; font-weight:700; color:#0f172a;">$25.00 USD</td>
+                </tr>
+            </table>
+            <div style="display:flex; gap:12px; justify-content:flex-end;">
+                <button onclick="closeReviewModal()" style="background:#e2e8f0; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:600;">Cancel</button>
+                <button id="continue-to-paypal-btn" onclick="startCheckout()" style="background:#ffc439; color:#003087; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:700;">Continue to PayPal</button>
+            </div>
+        </div>
     </div>
 
     <div class="controls">
@@ -60,21 +96,22 @@
         window.allTransactions = [];
 
         document.addEventListener('DOMContentLoaded', () => {
-            try {
-                spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
-                    columnDefs: [
-                        { field: "id", headerName: "Capture ID", flex: 2 },
-                        { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + (Number(p.value) || 0).toFixed(2) },
-                        { field: "status", headerName: "Status", flex: 1, cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' } },
-                        { field: "date", headerName: "Timestamp", flex: 2 },
-                        { field: "is_live", headerName: "Source", flex: 2, valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo", cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' } }
-                    ],
-                    rowData: [],
-                    defaultColDef: { resizable: true }
-                });
-            } catch (err) {
-                console.error("[grid init] FAILED:", err);
-            }
+            spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
+                columnDefs: [
+                    { field: "id", headerName: "Capture ID", flex: 2 },
+                    { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + p.value.toFixed(2) },
+                    { field: "status", headerName: "Status", flex: 1,
+                      cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
+                    },
+                    { field: "date", headerName: "Timestamp", flex: 2 },
+                    { field: "is_live", headerName: "Source", flex: 2,
+                      valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
+                      cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
+                    }
+                ],
+                rowData: [],
+                defaultColDef: { resizable: true }
+            });
 
             setTimeout(refreshDashboard, 100);
 
@@ -84,7 +121,6 @@
             }
         });
 
-        // FIX: Fetch each endpoint INDEPENDENTLY. If AI fails, transactions still render.
         async function refreshDashboard() {
             // 1. Transactions (critical — must render no matter what)
             try {
@@ -113,21 +149,36 @@
         }
 
         function applyFilter() {
-            if (!spendGridApi) { console.error("[filter] grid API not ready"); return; }
+            if (!spendGridApi) return;
             const filter = document.getElementById('source-filter').value;
             let filteredData = window.allTransactions || [];
-            if (filter === 'live') filteredData = filteredData.filter(r => r.is_live === true);
-            else if (filter === 'demo') filteredData = filteredData.filter(r => r.is_live === false);
-            console.log("[filter]", filter, "→", filteredData.length, "rows");
+
+            if (filter === 'live') {
+                filteredData = filteredData.filter(r => r.is_live === true);
+            } else if (filter === 'demo') {
+                filteredData = filteredData.filter(r => r.is_live === false);
+            }
             spendGridApi.setGridOption('rowData', filteredData);
         }
 
+        // --- Order review modal ---
+        function openReviewModal() {
+            document.getElementById('order-review-modal').style.display = 'flex';
+        }
+
+        function closeReviewModal() {
+            document.getElementById('order-review-modal').style.display = 'none';
+        }
+
         async function startCheckout() {
+            // Close the modal so the user sees the redirect happen
+            closeReviewModal();
+
             const btn = document.getElementById('paypal-btn');
             btn.disabled = true; btn.innerText = "Redirecting...";
             try {
                 const res = await fetch('/api/create-order', { method: 'POST' });
-                if (!res.ok) throw new Error("HTTP " + res.status);
+                if (!res.ok) throw new Error("Server error creating order");
                 const data = await res.json();
                 if (data.error) throw new Error(data.error);
                 window.location.href = data.approveURL;
@@ -145,17 +196,22 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ orderID: orderID })
                 });
+
                 let data;
                 try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
+
                 if (data.status === "capture_succeeded_persistence_pending") {
                     alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
                     window.history.replaceState({}, document.title, "/");
                     return;
                 }
+
                 if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
+
                 alert(`✅ Payment Captured! ID: ${data.id} for $${data.amount}`);
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
+
             } catch (err) {
                 alert("Capture Error: " + err.message);
                 window.history.replaceState({}, document.title, "/");
