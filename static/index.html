@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <title>PayPal Spend Intelligence Agent</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-quartz.css">
     <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 40px; background: #f4f7f9; color: #1e293b; }
@@ -15,8 +17,7 @@
         .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
-        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; }
-        .ag-theme-quartz { width: 100%; height: 100%; --ag-foreground-color: #1e293b; }
+        .grid-container { height: 400px; }
         .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
         .paypal-btn:hover { background-color: #f2ba36; }
         .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -29,22 +30,10 @@
     </div>
 
     <div class="summary-grid">
-        <div class="card">
-            <div class="card-title">Live Captured Revenue</div>
-            <div class="card-value" id="total-revenue">$0.00</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Live Successful Payments</div>
-            <div class="card-value" id="total-success">0</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Demo Completed (Synthetic)</div>
-            <div class="card-value" id="demo-success" style="color:#64748b;">0</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Decline Rate</div>
-            <div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div>
-        </div>
+        <div class="card"><div class="card-title">Live Captured Revenue</div><div class="card-value" id="total-revenue">$0.00</div></div>
+        <div class="card"><div class="card-title">Live Successful Payments</div><div class="card-value" id="total-success">0</div></div>
+        <div class="card"><div class="card-title">Demo Completed (Synthetic)</div><div class="card-value" id="demo-success" style="color:#64748b;">0</div></div>
+        <div class="card"><div class="card-title">Decline Rate</div><div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div></div>
     </div>
 
     <div class="checkout-area">
@@ -64,7 +53,6 @@
         </select>
     </div>
 
-    <!-- FIXED: Single class attribute -->
     <div id="spendGrid" class="grid-container ag-theme-quartz"></div>
 
     <script>
@@ -72,22 +60,21 @@
         window.allTransactions = [];
 
         document.addEventListener('DOMContentLoaded', () => {
-            spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
-                columnDefs: [
-                    { field: "id", headerName: "Capture ID", flex: 2 },
-                    { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + p.value.toFixed(2) },
-                    { field: "status", headerName: "Status", flex: 1, 
-                      cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
-                    },
-                    { field: "date", headerName: "Timestamp", flex: 2 },
-                    { field: "is_live", headerName: "Source", flex: 2, 
-                      valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
-                      cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
-                    }
-                ],
-                rowData: [],
-                defaultColDef: { resizable: true }
-            });
+            try {
+                spendGridApi = agGrid.createGrid(document.querySelector('#spendGrid'), {
+                    columnDefs: [
+                        { field: "id", headerName: "Capture ID", flex: 2 },
+                        { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + (Number(p.value) || 0).toFixed(2) },
+                        { field: "status", headerName: "Status", flex: 1, cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' } },
+                        { field: "date", headerName: "Timestamp", flex: 2 },
+                        { field: "is_live", headerName: "Source", flex: 2, valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo", cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' } }
+                    ],
+                    rowData: [],
+                    defaultColDef: { resizable: true }
+                });
+            } catch (err) {
+                console.error("[grid init] FAILED:", err);
+            }
 
             setTimeout(refreshDashboard, 100);
 
@@ -97,41 +84,43 @@
             }
         });
 
+        // FIX: Fetch each endpoint INDEPENDENTLY. If AI fails, transactions still render.
         async function refreshDashboard() {
+            // 1. Transactions (critical — must render no matter what)
             try {
-                const [intelRes, txRes] = await Promise.all([
-                    fetch('/api/spend-intelligence'),
-                    fetch('/api/transactions')
-                ]);
-
-                if (!intelRes.ok) throw new Error("Failed to load metrics");
-                if (!txRes.ok) throw new Error("Failed to load transactions");
-
-                const intel = await intelRes.json();
+                const txRes = await fetch('/api/transactions');
+                if (!txRes.ok) throw new Error("HTTP " + txRes.status);
                 const txData = await txRes.json();
-
-                document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
-                document.getElementById('total-revenue').innerText = '$' + intel.total_captured.toFixed(2);
-                document.getElementById('total-success').innerText = intel.live_success;
-                document.getElementById('demo-success').innerText = intel.demo_completed_count;
-
+                console.log("[transactions] loaded", txData.length, "rows");
                 window.allTransactions = txData;
-                applyFilter(); 
+                applyFilter();
             } catch (err) {
-                document.getElementById('ai-insight').innerText = "❌ " + err.message;
+                console.error("[transactions] FAILED:", err);
+                document.getElementById('ai-insight').innerText = "❌ Transactions failed: " + err.message;
+            }
+
+            // 2. Metrics + AI (non-critical — failure must not block the grid)
+            try {
+                const intelRes = await fetch('/api/spend-intelligence');
+                if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
+                const intel = await intelRes.json();
+                document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
+                document.getElementById('total-revenue').innerText = '$' + (intel.total_captured || 0).toFixed(2);
+                document.getElementById('total-success').innerText = intel.live_success || 0;
+                document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;
+            } catch (err) {
+                console.error("[metrics] FAILED:", err);
+                document.getElementById('ai-insight').innerText = "⚠️ AI metrics unavailable (grid still works)";
             }
         }
 
         function applyFilter() {
-            if (!spendGridApi) return;
+            if (!spendGridApi) { console.error("[filter] grid API not ready"); return; }
             const filter = document.getElementById('source-filter').value;
             let filteredData = window.allTransactions || [];
-
-            if (filter === 'live') {
-                filteredData = filteredData.filter(r => r.is_live === true);
-            } else if (filter === 'demo') {
-                filteredData = filteredData.filter(r => r.is_live === false);
-            }
+            if (filter === 'live') filteredData = filteredData.filter(r => r.is_live === true);
+            else if (filter === 'demo') filteredData = filteredData.filter(r => r.is_live === false);
+            console.log("[filter]", filter, "→", filteredData.length, "rows");
             spendGridApi.setGridOption('rowData', filteredData);
         }
 
@@ -140,7 +129,7 @@
             btn.disabled = true; btn.innerText = "Redirecting...";
             try {
                 const res = await fetch('/api/create-order', { method: 'POST' });
-                if (!res.ok) throw new Error("Server error creating order");
+                if (!res.ok) throw new Error("HTTP " + res.status);
                 const data = await res.json();
                 if (data.error) throw new Error(data.error);
                 window.location.href = data.approveURL;
@@ -158,22 +147,17 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ orderID: orderID })
                 });
-
                 let data;
                 try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
-
                 if (data.status === "capture_succeeded_persistence_pending") {
                     alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
                     window.history.replaceState({}, document.title, "/");
                     return;
                 }
-
                 if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
-
                 alert(`✅ Payment Captured! ID: ${data.id} for $${data.amount}`);
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
-
             } catch (err) {
                 alert("Capture Error: " + err.message);
                 window.history.replaceState({}, document.title, "/");
