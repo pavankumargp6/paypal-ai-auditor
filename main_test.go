@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -63,6 +65,7 @@ func mockReadError(t *testing.T) {
 func mockEndpoints(t *testing.T, verifyBody, captureBody, reconcileBody string) {
 	t.Helper()
 	saveTransport(t)
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error { return fn() })
 	getCount := 0
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
 		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
@@ -410,6 +413,174 @@ func TestParseCaptureFromBody_NotCompleted(t *testing.T) {
 	_, err := parseCaptureFromBody(body)
 	if err == nil {
 		t.Error("Expected error on non-COMPLETED capture")
+	}
+}
+
+func setOrderLock(t *testing.T, lock func(context.Context, string, func() error) error) {
+	t.Helper()
+	original := orderLock
+	orderLock = lock
+	t.Cleanup(func() { orderLock = original })
+}
+
+func TestCaptureOrderHandler_AlreadyCapturedResponseReconciles(t *testing.T) {
+	saveTransport(t)
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error { return fn() })
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	getCount := 0
+	captureCalls := 0
+	requestIDs := []string{}
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		}
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/v2/checkout/orders/") {
+			getCount++
+			if getCount == 1 {
+				return resp(http.StatusOK, `{"status":"APPROVED"}`), nil
+			}
+			return resp(http.StatusOK, completedOrder), nil
+		}
+		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/capture") {
+			captureCalls++
+			requestIDs = append(requestIDs, req.Header.Get("PayPal-Request-Id"))
+			return resp(http.StatusUnprocessableEntity, `{"name":"UNPROCESSABLE_ENTITY","details":[{"issue":"ORDER_ALREADY_CAPTURED"}]}`), nil
+		}
+		return resp(http.StatusNotFound, `{}`), nil
+	})
+
+	persistCalls := 0
+	originalPersist := persistCapture
+	persistCapture = func(ctx context.Context, payment PaymentRecord) error {
+		persistCalls++
+		return nil
+	}
+	t.Cleanup(func() { persistCapture = originalPersist })
+
+	handler := makeCaptureOrderHandler("fake", "fake")
+	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 after reconciliation, got %d: %s", w.Code, w.Body.String())
+	}
+	var payment PaymentRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &payment); err != nil {
+		t.Fatalf("decode payment response: %v", err)
+	}
+	if payment.ID != "CAPWINNER" {
+		t.Fatalf("reconciled capture ID = %q, want CAPWINNER", payment.ID)
+	}
+	if captureCalls != 1 || persistCalls != 1 {
+		t.Fatalf("capture calls=%d, persist calls=%d; want one each", captureCalls, persistCalls)
+	}
+	if len(requestIDs) != 1 || requestIDs[0] != captureRequestID("ORDER123") {
+		t.Fatalf("capture request IDs=%v, want [%q]", requestIDs, captureRequestID("ORDER123"))
+	}
+}
+
+func TestCaptureOrderHandler_ConcurrentRequestsCaptureOnce(t *testing.T) {
+	saveTransport(t)
+	var orderMutex sync.Mutex
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error {
+		orderMutex.Lock()
+		defer orderMutex.Unlock()
+		return fn()
+	})
+
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	var stateMu sync.Mutex
+	orderCompleted := false
+	captureCalls := 0
+	requestIDs := []string{}
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		}
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/v2/checkout/orders/") {
+			stateMu.Lock()
+			completed := orderCompleted
+			stateMu.Unlock()
+			if completed {
+				return resp(http.StatusOK, completedOrder), nil
+			}
+			return resp(http.StatusOK, `{"status":"APPROVED"}`), nil
+		}
+		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/capture") {
+			stateMu.Lock()
+			defer stateMu.Unlock()
+			captureCalls++
+			requestIDs = append(requestIDs, req.Header.Get("PayPal-Request-Id"))
+			orderCompleted = true
+			return resp(http.StatusOK, completedOrder), nil
+		}
+		return resp(http.StatusNotFound, `{}`), nil
+	})
+
+	rows := map[string]PaymentRecord{}
+	var rowsMu sync.Mutex
+	originalPersist := persistCapture
+	persistCapture = func(ctx context.Context, payment PaymentRecord) error {
+		rowsMu.Lock()
+		defer rowsMu.Unlock()
+		rows[payment.ID] = payment
+		return nil
+	}
+	t.Cleanup(func() { persistCapture = originalPersist })
+
+	const requestCount = 12
+	type result struct {
+		status int
+		body   string
+	}
+	results := make([]result, requestCount)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	handler := makeCaptureOrderHandler("fake", "fake")
+	for i := 0; i < requestCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			results[i] = result{status: w.Code, body: w.Body.String()}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, result := range results {
+		if result.status != http.StatusOK {
+			t.Errorf("request %d returned %d: %s", i, result.status, result.body)
+			continue
+		}
+		var payment PaymentRecord
+		if err := json.Unmarshal([]byte(result.body), &payment); err != nil {
+			t.Errorf("request %d response JSON: %v", i, err)
+			continue
+		}
+		if payment.ID != "CAPWINNER" || payment.AmountMinor != 2500 {
+			t.Errorf("request %d returned payment %+v, want winning capture CAPWINNER/2500", i, payment)
+		}
+	}
+	stateMu.Lock()
+	gotCaptureCalls := captureCalls
+	gotRequestIDs := append([]string(nil), requestIDs...)
+	stateMu.Unlock()
+	rowsMu.Lock()
+	gotRows := len(rows)
+	row, hasWinner := rows["CAPWINNER"]
+	rowsMu.Unlock()
+	if gotCaptureCalls != 1 {
+		t.Errorf("PayPal capture calls = %d, want 1", gotCaptureCalls)
+	}
+	if len(gotRequestIDs) != 1 || gotRequestIDs[0] != captureRequestID("ORDER123") {
+		t.Errorf("PayPal request IDs = %v, want [%q]", gotRequestIDs, captureRequestID("ORDER123"))
+	}
+	if gotRows != 1 || !hasWinner || row.AmountMinor != 2500 {
+		t.Errorf("persisted rows = %d, winning row=%+v found=%t; want exactly one winner row", gotRows, row, hasWinner)
 	}
 }
 

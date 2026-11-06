@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,10 +26,13 @@ const (
 	expectedCurrency          = "USD"
 )
 
+var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
+
 var (
 	db           *sql.DB
 	httpClient   = &http.Client{Timeout: 15 * time.Second}
 	orderIDRegex = regexp.MustCompile(`^[A-Z0-9]{1,50}$`)
+	orderLock    = withPostgresOrderAdvisoryLock
 
 	allowedPayPalHosts = map[string]bool{
 		"www.sandbox.paypal.com": true,
@@ -285,44 +289,15 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			return
 		}
 
-		status, err := verifyOrderStatus(ctx, token, reqBody.OrderID)
-		if err != nil {
-			log.Printf("capture-order verify: %v", err)
-			sendJSONError(w, "Failed to verify order status", http.StatusBadGateway)
+		payment, failureStatus, failureMessage, persistenceErr, flowErr := captureOrderWithLock(ctx, token, reqBody.OrderID)
+		if failureStatus != 0 {
+			log.Printf("capture-order: %v", flowErr)
+			sendJSONError(w, failureMessage, failureStatus)
 			return
 		}
-
-		var payment PaymentRecord
-		switch status {
-		case "COMPLETED":
-			payment, err = reconcileCapture(ctx, token, reqBody.OrderID)
-			if err != nil {
-				log.Printf("capture-order reconcile: %v", err)
-				sendJSONError(w, "Reconcile failed", http.StatusBadGateway)
-				return
-			}
-		case "APPROVED":
-			payment, err = capturePayPalOrder(ctx, token, reqBody.OrderID)
-			if err != nil {
-				log.Printf("capture-order capture: %v", err)
-				sendJSONError(w, "Capture failed", http.StatusBadGateway)
-				return
-			}
-		default:
-			log.Printf("capture-order: unexpected order status %q", status)
-			sendJSONError(w, fmt.Sprintf("Order status is %s. Must be APPROVED.", status), http.StatusBadRequest)
-			return
-		}
-
-		if err := validatePayment(payment); err != nil {
-			log.Printf("capture-order validation: %v", err)
-			sendJSONError(w, "Payment validation failed", http.StatusBadGateway)
-			return
-		}
-
-		if err := persistCapture(ctx, payment); err != nil {
+		if persistenceErr != nil {
 			correlationID := fmt.Sprintf("cap-%d", time.Now().UnixNano())
-			log.Printf("[%s] capture-order persistence: %v", correlationID, err)
+			log.Printf("[%s] capture-order persistence: %v", correlationID, persistenceErr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -337,6 +312,86 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(payment)
 	}
+}
+
+func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRecord, int, string, error, error) {
+	var payment PaymentRecord
+	var failureStatus int
+	var failureMessage string
+	var persistenceErr error
+
+	runErr := orderLock(ctx, orderID, func() error {
+		status, err := verifyOrderStatus(ctx, token, orderID)
+		if err != nil {
+			failureStatus = http.StatusBadGateway
+			failureMessage = "Failed to verify order status"
+			return err
+		}
+
+		switch status {
+		case "COMPLETED":
+			payment, err = reconcileCapture(ctx, token, orderID)
+			if err != nil {
+				failureStatus = http.StatusBadGateway
+				failureMessage = "Reconcile failed"
+				return err
+			}
+		case "APPROVED":
+			payment, err = capturePayPalOrder(ctx, token, orderID)
+			if errors.Is(err, errOrderAlreadyCaptured) {
+				payment, err = reconcileCapture(ctx, token, orderID)
+				if err != nil {
+					failureStatus = http.StatusBadGateway
+					failureMessage = "Reconcile failed after PayPal reported an already-captured order"
+					return err
+				}
+			} else if err != nil {
+				failureStatus = http.StatusBadGateway
+				failureMessage = "Capture failed"
+				return err
+			}
+		default:
+			failureStatus = http.StatusBadRequest
+			failureMessage = fmt.Sprintf("Order status is %s. Must be APPROVED.", status)
+			return fmt.Errorf("unexpected order status %q", status)
+		}
+
+		if err := validatePayment(payment); err != nil {
+			failureStatus = http.StatusBadGateway
+			failureMessage = "Payment validation failed"
+			return err
+		}
+
+		persistenceErr = persistCapture(ctx, payment)
+		return nil
+	})
+	if runErr != nil && failureStatus == 0 {
+		if payment.ID != "" {
+			persistenceErr = runErr
+		} else {
+			failureStatus = http.StatusInternalServerError
+			failureMessage = "Failed to acquire or release order capture lock"
+		}
+	}
+	return payment, failureStatus, failureMessage, persistenceErr, runErr
+}
+
+func withPostgresOrderAdvisoryLock(ctx context.Context, orderID string, fn func() error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin capture lock transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, orderID); err != nil {
+		return fmt.Errorf("acquire capture advisory lock: %w", err)
+	}
+	if err := fn(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("release capture advisory lock: %w", err)
+	}
+	return nil
 }
 
 func makeSpendHandler(groqKey string) http.HandlerFunc {
@@ -529,6 +584,10 @@ func verifyOrderStatus(ctx context.Context, token, orderID string) (string, erro
 	return result.Status, nil
 }
 
+func captureRequestID(orderID string) string {
+	return "paypal-ai-auditor-capture-" + orderID
+}
+
 func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentRecord, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s/capture", orderID), nil)
@@ -537,6 +596,7 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("PayPal-Request-Id", captureRequestID(orderID))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -549,9 +609,29 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 		return PaymentRecord{}, fmt.Errorf("read capture body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if paypalResponseHasIssue(body, "ORDER_ALREADY_CAPTURED") {
+			return PaymentRecord{}, fmt.Errorf("%w (HTTP %d)", errOrderAlreadyCaptured, resp.StatusCode)
+		}
 		return PaymentRecord{}, fmt.Errorf("capture request failed with status %d", resp.StatusCode)
 	}
 	return parseCaptureFromBody(body)
+}
+
+func paypalResponseHasIssue(body []byte, issue string) bool {
+	var response struct {
+		Details []struct {
+			Issue string `json:"issue"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	for _, detail := range response.Details {
+		if detail.Issue == issue {
+			return true
+		}
+	}
+	return false
 }
 
 func reconcileCapture(ctx context.Context, token, orderID string) (PaymentRecord, error) {
