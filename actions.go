@@ -154,7 +154,7 @@ func makeFindingActionHandler() http.HandlerFunc {
 		err = tx.QueryRowContext(ctx, `INSERT INTO actions (finding_id, action_type, status, result)
 			VALUES ($1, $2, 'proposed', jsonb_build_object(
 				'events', jsonb_build_array(jsonb_build_object('status', 'proposed', 'at', NOW(), 'money_moved', FALSE,
-				'action_type', $2, 'description', $3)),
+				'action_type', $2::text, 'description', $3::text)),
 				'money_moved', FALSE, 'execution_mode', 'record_only'))
 			RETURNING id, finding_id, action_type, status, result`, findingID, proposal.ActionType, proposal.Description).
 			Scan(&response.ID, &response.FindingID, &response.ActionType, &response.Status, &response.Result)
