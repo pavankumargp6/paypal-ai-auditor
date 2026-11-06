@@ -115,9 +115,9 @@
                           cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
                         },
                         { field: "date", headerName: "Timestamp", flex: 2 },
-                        { field: "is_live", headerName: "Source", flex: 2,
-                          valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
-                          cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
+                        { field: "is_live", headerName: "Source", flex: 2, cellDataType: "text",
+                          valueGetter: p => p.data.is_live === true ? "PayPal Sandbox (Live)" : "Synthetic Demo",
+                          cellStyle: p => p.data.is_live === true ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
                         }
                     ],
                     rowData: [],

@@ -45,6 +45,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Prepare disposable migration baseline
+        env:
+          DATABASE_URL: ${{ env.PAYPAL_AI_AUDITOR_TEST_DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE TABLE captures (id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL, currency TEXT NOT NULL, date TEXT NOT NULL, is_live BOOLEAN NOT NULL)"
+
+      - name: Apply additive migrations to CI database
+        env:
+          DATABASE_URL: ${{ env.PAYPAL_AI_AUDITOR_TEST_DATABASE_URL }}
+        run: |
+          go run ./cmd/migrate ./migrations/001_amount_minor.sql
+          go run ./cmd/migrate ./migrations/002_attempts.sql
+
       - name: Verify gofmt
         run: |
           unformatted="$(gofmt -l .)"

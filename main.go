@@ -36,7 +36,11 @@ END)::BIGINT)`
 const liveRecordsQuery = `SELECT id, ` + amountMinorFallbackExpression + ` AS amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`
 
 const declineRateQuery = `SELECT COUNT(*) FILTER (WHERE outcome = 'declined'), COUNT(*)
-	FROM attempts WHERE stage = 'capture' AND is_synthetic = FALSE`
+	FROM attempts
+	WHERE stage = 'capture'
+	  AND is_synthetic = FALSE
+	  AND outcome IN ('succeeded', 'declined', 'failed')
+	  AND COALESCE(reason_code, '') <> 'ORDER_ALREADY_CAPTURED'`
 
 var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
 
@@ -46,14 +50,17 @@ type PayPalErrorDetail struct {
 }
 
 type PaymentAttempt struct {
-	Stage        string
-	Outcome      string
-	ReasonCode   string
-	ReasonDetail string
-	HTTPStatus   *int
-	AmountMinor  int64
-	Currency     string
-	IsSynthetic  bool
+	PayPalOrderID string
+	CaptureID     string
+	DebugID       string
+	Stage         string
+	Outcome       string
+	ReasonCode    string
+	ReasonDetail  string
+	HTTPStatus    *int
+	AmountMinor   int64
+	Currency      string
+	IsSynthetic   bool
 }
 
 // PayPalAPIError preserves structured response fields without retaining or logging
@@ -148,10 +155,10 @@ var (
 			return fmt.Errorf("database unavailable")
 		}
 		_, err := targetDB.ExecContext(ctx, `INSERT INTO attempts
-			(stage, outcome, reason_code, reason_detail, http_status, amount_minor, currency, is_synthetic)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			attempt.Stage, attempt.Outcome, attempt.ReasonCode, attempt.ReasonDetail,
-			attempt.HTTPStatus, attempt.AmountMinor, attempt.Currency, attempt.IsSynthetic)
+			(paypal_order_id, capture_id, debug_id, stage, outcome, reason_code, reason_detail, http_status, amount_minor, currency, is_synthetic)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			attempt.PayPalOrderID, attempt.CaptureID, attempt.DebugID, attempt.Stage, attempt.Outcome,
+			attempt.ReasonCode, attempt.ReasonDetail, attempt.HTTPStatus, attempt.AmountMinor, attempt.Currency, attempt.IsSynthetic)
 		return err
 	}
 
@@ -405,7 +412,9 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			sendJSONError(w, "Order creation failed", http.StatusBadGateway)
 			return
 		}
-		recordAttemptBestEffort(successfulAttempt("create", "ORDER_CREATED", "PayPal order created", expectedAmountMinor, expectedCurrency, httpStatus))
+		attempt := successfulAttempt("create", "ORDER_CREATED", "PayPal order created", expectedAmountMinor, expectedCurrency, httpStatus)
+		attempt.PayPalOrderID = orderID
+		recordAttemptBestEffort(attempt)
 		if approveURL == "" {
 			log.Printf("create-order: missing approval link in PayPal response")
 			sendJSONError(w, "Missing approval link", http.StatusBadGateway)
@@ -442,7 +451,7 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
-			recordAttemptBestEffort(attemptFromPayPalError("approve", expectedAmountMinor, expectedCurrency, err))
+			recordOrderAttempt(reqBody.OrderID, attemptFromPayPalError("approve", expectedAmountMinor, expectedCurrency, err))
 			log.Printf("capture-order auth: %v", err)
 			sendJSONError(w, "PayPal auth failed", http.StatusBadGateway)
 			return
@@ -482,7 +491,7 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 	runErr := orderLock(ctx, orderID, func(lockCtx context.Context) error {
 		status, verifyHTTPStatus, err := verifyOrderStatusWithStatus(lockCtx, token, orderID)
 		if err != nil {
-			recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("approve", expectedAmountMinor, expectedCurrency, verifyHTTPStatus, err))
+			recordOrderAttempt(orderID, attemptFromPayPalErrorWithStatus("approve", expectedAmountMinor, expectedCurrency, verifyHTTPStatus, err))
 			failureStatus = http.StatusBadGateway
 			failureMessage = "Failed to verify order status"
 			return err
@@ -492,22 +501,24 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 		case "COMPLETED":
 			attempt := successfulAttempt("approve", "ORDER_ALREADY_CAPTURED", "PayPal order was already completed", expectedAmountMinor, expectedCurrency, verifyHTTPStatus)
 			attempt.Outcome = "reconciled"
-			recordAttemptBestEffort(attempt)
+			recordOrderAttempt(orderID, attempt)
 			var reconcileHTTPStatus int
 			var reconcileErr error
 			payment, reconcileHTTPStatus, reconcileErr = reconcileCaptureWithStatus(lockCtx, token, orderID)
 			err = reconcileErr
 			if err != nil {
-				recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
+				recordOrderAttempt(orderID, attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
 				failureStatus = http.StatusBadGateway
 				failureMessage = "Reconcile failed"
 				return err
 			}
 			captureAttempt := successfulAttempt("capture", "ORDER_ALREADY_CAPTURED", "Capture reconciled from the completed PayPal order", payment.AmountMinor, payment.Currency, reconcileHTTPStatus)
 			captureAttempt.Outcome = "reconciled"
-			recordAttemptBestEffort(captureAttempt)
+			captureAttempt.CaptureID = payment.ID
+			recordOrderAttempt(orderID, captureAttempt)
 		case "APPROVED":
-			recordAttemptBestEffort(successfulAttempt("approve", "ORDER_APPROVED", "PayPal order is approved", expectedAmountMinor, expectedCurrency, verifyHTTPStatus))
+			approveAttempt := successfulAttempt("approve", "ORDER_APPROVED", "PayPal order is approved", expectedAmountMinor, expectedCurrency, verifyHTTPStatus)
+			recordOrderAttempt(orderID, approveAttempt)
 			var captureHTTPStatus int
 			var captureErr error
 			payment, captureHTTPStatus, captureErr = capturePayPalOrderWithStatus(lockCtx, token, orderID)
@@ -515,29 +526,33 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 			if errors.Is(err, errOrderAlreadyCaptured) {
 				captureAttempt := attemptFromPayPalErrorWithStatus("capture", expectedAmountMinor, expectedCurrency, captureHTTPStatus, err)
 				captureAttempt.Outcome = "reconciled"
-				recordAttemptBestEffort(captureAttempt)
+				recordOrderAttempt(orderID, captureAttempt)
 				var reconcileHTTPStatus int
 				var reconcileErr error
 				payment, reconcileHTTPStatus, reconcileErr = reconcileCaptureWithStatus(lockCtx, token, orderID)
 				err = reconcileErr
 				if err != nil {
-					recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
+					recordOrderAttempt(orderID, attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
 					failureStatus = http.StatusBadGateway
 					failureMessage = "Reconcile failed after PayPal reported an already-captured order"
 					return err
 				}
-				recordAttemptBestEffort(successfulAttempt("reconcile", "CAPTURE_RECONCILED", "PayPal capture reconciled", payment.AmountMinor, payment.Currency, reconcileHTTPStatus))
+				reconcileAttempt := successfulAttempt("reconcile", "CAPTURE_RECONCILED", "PayPal capture reconciled", payment.AmountMinor, payment.Currency, reconcileHTTPStatus)
+				reconcileAttempt.CaptureID = payment.ID
+				recordOrderAttempt(orderID, reconcileAttempt)
 			} else if err != nil {
-				recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("capture", expectedAmountMinor, expectedCurrency, captureHTTPStatus, err))
+				recordOrderAttempt(orderID, attemptFromPayPalErrorWithStatus("capture", expectedAmountMinor, expectedCurrency, captureHTTPStatus, err))
 				failureStatus = http.StatusBadGateway
 				failureMessage = "Capture failed"
 				return err
 			} else {
-				recordAttemptBestEffort(successfulAttempt("capture", "CAPTURE_COMPLETED", "PayPal capture completed", payment.AmountMinor, payment.Currency, captureHTTPStatus))
+				captureAttempt := successfulAttempt("capture", "CAPTURE_COMPLETED", "PayPal capture completed", payment.AmountMinor, payment.Currency, captureHTTPStatus)
+				captureAttempt.CaptureID = payment.ID
+				recordOrderAttempt(orderID, captureAttempt)
 			}
 		default:
 			attempt := PaymentAttempt{Stage: "approve", Outcome: "failed", ReasonCode: "ORDER_NOT_APPROVED", ReasonDetail: "PayPal order status is " + status, HTTPStatus: &verifyHTTPStatus, AmountMinor: expectedAmountMinor, Currency: expectedCurrency}
-			recordAttemptBestEffort(attempt)
+			recordOrderAttempt(orderID, attempt)
 			failureStatus = http.StatusBadRequest
 			failureMessage = fmt.Sprintf("Order status is %s. Must be APPROVED.", status)
 			return fmt.Errorf("unexpected order status %q", status)
@@ -1039,6 +1054,11 @@ func recordAttemptBestEffort(attempt PaymentAttempt) {
 	}()
 }
 
+func recordOrderAttempt(orderID string, attempt PaymentAttempt) {
+	attempt.PayPalOrderID = orderID
+	recordAttemptBestEffort(attempt)
+}
+
 func attemptFromPayPalError(stage string, amountMinor int64, currency string, err error) PaymentAttempt {
 	attempt := PaymentAttempt{
 		Stage:        stage,
@@ -1054,6 +1074,7 @@ func attemptFromPayPalError(stage string, amountMinor int64, currency string, er
 	}
 	attempt.ReasonCode = apiErr.ReasonCode
 	attempt.ReasonDetail = apiErr.ReasonDetail
+	attempt.DebugID = apiErr.DebugID
 	attempt.HTTPStatus = &apiErr.HTTPStatus
 	switch strings.ToUpper(apiErr.ReasonCode) {
 	case "INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY", "PAYMENT_DENIED":
@@ -1118,16 +1139,18 @@ func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		log.Printf("Groq insight request failed http_status=unavailable error_code=NETWORK_ERROR")
 		return "AI insight unavailable."
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		log.Printf("Groq insight request failed http_status=%d error_code=BODY_READ_ERROR", resp.StatusCode)
 		return "AI insight unavailable."
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Groq insight request failed http_status=%d error_code=%s", resp.StatusCode, groqErrorCode(body))
 		return "AI insight unavailable."
 	}
 
@@ -1139,17 +1162,45 @@ func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary)
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("Groq insight request failed http_status=%d error_code=INVALID_RESPONSE", resp.StatusCode)
 		return "AI insight unavailable."
 	}
 	if len(result.Choices) == 0 {
+		log.Printf("Groq insight request failed http_status=%d error_code=EMPTY_CHOICES", resp.StatusCode)
 		return "AI insight unavailable."
 	}
 
 	insight := strings.TrimSpace(result.Choices[0].Message.Content)
 	if insight == "" {
+		log.Printf("Groq insight request failed http_status=%d error_code=EMPTY_CONTENT", resp.StatusCode)
 		return "AI insight unavailable."
 	}
 	return insight
+}
+
+func groqErrorCode(body []byte) string {
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return "UNCLASSIFIED"
+	}
+	code := strings.TrimSpace(response.Error.Code)
+	if code == "" {
+		code = strings.TrimSpace(response.Error.Type)
+	}
+	if code == "" || len(code) > 48 {
+		return "UNCLASSIFIED"
+	}
+	for _, char := range code {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.') {
+			return "UNCLASSIFIED"
+		}
+	}
+	return code
 }
 
 func sendJSONError(w http.ResponseWriter, msg string, code int) {

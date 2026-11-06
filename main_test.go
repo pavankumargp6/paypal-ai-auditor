@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -196,6 +198,8 @@ func TestDashboardUsesMinorUnitAPIFields(t *testing.T) {
 		`formatMinorCurrency(intel.total_captured_minor, 'USD')`,
 		`BigInt(minor ?? "0")`,
 		`style: "currency", currency`,
+		`cellDataType: "text"`,
+		`valueGetter: p => p.data.is_live === true ? "PayPal Sandbox (Live)" : "Synthetic Demo"`,
 		`id="decline-rate"`,
 		`intel.decline_rate_percent`,
 		`"No data yet"`,
@@ -616,7 +620,7 @@ func TestDeclineRateNoDataAndCalculation(t *testing.T) {
 	if rate, available := declineRate(2, 5); !available || rate != 40 {
 		t.Fatalf("decline rate = %v/%v, want 40%% available", rate, available)
 	}
-	if !strings.Contains(declineRateQuery, "stage = 'capture'") || !strings.Contains(declineRateQuery, "is_synthetic = FALSE") || !strings.Contains(declineRateQuery, "outcome = 'declined'") {
+	if !strings.Contains(declineRateQuery, "stage = 'capture'") || !strings.Contains(declineRateQuery, "is_synthetic = FALSE") || !strings.Contains(declineRateQuery, "outcome = 'declined'") || !strings.Contains(declineRateQuery, "ORDER_ALREADY_CAPTURED") || strings.Contains(declineRateQuery, "stage = 'reconcile'") {
 		t.Fatalf("decline-rate query must count real capture attempts only: %s", declineRateQuery)
 	}
 }
@@ -627,13 +631,53 @@ func TestAttemptsMigrationIsAdditiveAndHasRequiredColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlText := strings.ToLower(string(contents))
-	for _, column := range []string{"stage text not null", "outcome text not null", "reason_code text not null", "reason_detail text not null", "http_status integer", "amount_minor bigint not null", "currency text not null", "is_synthetic boolean not null", "created_at timestamptz not null"} {
+	for _, column := range []string{"paypal_order_id text", "capture_id text", "debug_id text", "stage text not null", "outcome text not null", "reason_code text,", "reason_detail text,", "http_status integer", "amount_minor bigint not null", "currency text not null", "is_synthetic boolean not null", "created_at timestamptz not null", "attempts_stage_check", "attempts_outcome_check", "attempts_http_status_check", "attempts_paypal_order_created_at_idx"} {
 		if !strings.Contains(sqlText, column) {
 			t.Errorf("migration 002 missing required column declaration %q", column)
 		}
 	}
 	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "alter table") {
 		t.Fatal("migration 002 must only add the attempts table and index")
+	}
+}
+
+func TestGroqErrorCodeIsShortAndRedacted(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "code", body: `{"error":{"code":"invalid_api_key","message":"do not log"}}`, want: "invalid_api_key"},
+		{name: "type fallback", body: `{"error":{"type":"authentication_error"}}`, want: "authentication_error"},
+		{name: "unclassified", body: `not-json`, want: "UNCLASSIFIED"},
+		{name: "unsafe", body: `{"error":{"code":"token=secret"}}`, want: "UNCLASSIFIED"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := groqErrorCode([]byte(tc.body)); got != tc.want {
+				t.Fatalf("groqErrorCode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGroqFailureLogsOnlyStatusAndErrorCode(t *testing.T) {
+	mockResponse(t, http.StatusUnauthorized, `{"error":{"code":"invalid_api_key","message":"Bearer secret-value"}}`)
+	previousOutput := log.Writer()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+	if got := generateAIInsight(context.Background(), "never-log-this-key", SpendSummary{}); got != "AI insight unavailable." {
+		t.Fatalf("generateAIInsight() = %q", got)
+	}
+	logged := output.String()
+	if !strings.Contains(logged, "http_status=401 error_code=invalid_api_key") {
+		t.Fatalf("diagnostic log = %q, want status and short code", logged)
+	}
+	for _, secret := range []string{"never-log-this-key", "secret-value", "Bearer", "message"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("diagnostic log leaked %q: %q", secret, logged)
+		}
 	}
 }
 
