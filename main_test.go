@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -84,14 +85,95 @@ func mockEndpoints(t *testing.T, verifyBody, captureBody, reconcileBody string) 
 // --- Validation ---
 
 func TestValidatePayment(t *testing.T) {
-	if err := validatePayment(PaymentRecord{Amount: 25.00, Currency: "USD"}); err != nil {
+	if err := validatePayment(PaymentRecord{AmountMinor: 2500, Currency: "USD"}); err != nil {
 		t.Error("Valid failed")
 	}
-	if err := validatePayment(PaymentRecord{Amount: 24.00, Currency: "USD"}); err == nil {
+	if err := validatePayment(PaymentRecord{AmountMinor: 2400, Currency: "USD"}); err == nil {
 		t.Error("Wrong amount passed")
 	}
-	if err := validatePayment(PaymentRecord{Amount: 25.00, Currency: "EUR"}); err == nil {
+	if err := validatePayment(PaymentRecord{AmountMinor: 2500, Currency: "EUR"}); err == nil {
 		t.Error("Wrong currency passed")
+	}
+}
+
+func TestParseMinorUnits(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		currency string
+		want     int64
+	}{
+		{"one cent", "0.01", "USD", 1},
+		{"whole amount", "25", "USD", 2500},
+		{"grouping-sized amount", "1234.50", "USD", 123450},
+		{"zero decimal JPY", "25", "JPY", 25},
+		{"zero decimal HUF", "25", "HUF", 25},
+		{"zero decimal TWD", "25", "TWD", 25},
+		{"zero value", "0", "USD", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMinorUnits(tt.value, tt.currency)
+			if err != nil {
+				t.Fatalf("parseMinorUnits(%q, %q): %v", tt.value, tt.currency, err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseMinorUnitsRejectsMalformedAmounts(t *testing.T) {
+	tests := []struct {
+		value    string
+		currency string
+	}{
+		{"", "USD"},
+		{".01", "USD"},
+		{"25.", "USD"},
+		{"25.001", "USD"},
+		{"1e2", "USD"},
+		{"-1", "USD"},
+		{"+1", "USD"},
+		{"1,000", "USD"},
+		{"1.0", "JPY"},
+		{"92233720368547759.99", "USD"},
+	}
+	for _, tt := range tests {
+		if _, err := parseMinorUnits(tt.value, tt.currency); err == nil {
+			t.Errorf("parseMinorUnits(%q, %q) unexpectedly succeeded", tt.value, tt.currency)
+		}
+	}
+}
+
+func TestFormatMinorUnits(t *testing.T) {
+	tests := []struct {
+		minor    int64
+		currency string
+		want     string
+	}{
+		{1, "USD", "0.01"},
+		{123450, "USD", "1234.50"},
+		{25, "JPY", "25"},
+	}
+	for _, tt := range tests {
+		if got := formatMinorUnits(tt.minor, tt.currency); got != tt.want {
+			t.Errorf("formatMinorUnits(%d, %q) = %q, want %q", tt.minor, tt.currency, got, tt.want)
+		}
+	}
+}
+
+func TestMoneyFieldsUseIntegerMinorUnits(t *testing.T) {
+	types := []reflect.Type{reflect.TypeOf(PaymentRecord{}), reflect.TypeOf(SpendSummary{})}
+	for _, typ := range types {
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			name := strings.ToLower(field.Name)
+			if (strings.Contains(name, "amount") || strings.Contains(name, "totalcaptured")) && field.Type.Kind() == reflect.Float64 {
+				t.Errorf("money field %s.%s uses float64", typ.Name(), field.Name)
+			}
+		}
 	}
 }
 

@@ -109,7 +109,7 @@
                 spendGridApi = agGrid.createGrid(gridDiv, {
                     columnDefs: [
                         { field: "id", headerName: "Capture ID", flex: 2 },
-                        { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + Number(p.value || 0).toFixed(2) },
+                        { field: "amount_minor", headerName: "Amount", flex: 1, valueFormatter: p => formatMinorCurrency(p.value, p.data.currency) },
                         { field: "status", headerName: "Status", flex: 1,
                           cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
                         },
@@ -135,6 +135,21 @@
             }
         });
 
+        function formatMinorCurrency(minor, currency = "USD") {
+            const exponent = ["JPY", "HUF", "TWD"].includes(currency.toUpperCase()) ? 0 : 2;
+            const amount = BigInt(minor ?? "0");
+            const scale = 10n ** BigInt(exponent);
+            const absolute = amount < 0n ? -amount : amount;
+            const whole = absolute / scale;
+            const fraction = absolute % scale;
+            const signedWhole = amount < 0n ? -whole : whole;
+            const formatted = new Intl.NumberFormat("en-US", {
+                style: "currency", currency, maximumFractionDigits: 0
+            }).format(signedWhole);
+            if (exponent === 0) return formatted;
+            return formatted + "." + fraction.toString().padStart(exponent, "0");
+        }
+
         async function refreshDashboard() {
             try {
                 const txRes = await fetch('/api/transactions');
@@ -153,7 +168,7 @@
                 if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
                 const intel = await intelRes.json();
                 document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
-                document.getElementById('total-revenue').innerText = '$' + (intel.total_captured || 0).toFixed(2);
+                document.getElementById('total-revenue').innerText = formatMinorCurrency(intel.total_captured_minor, 'USD');
                 document.getElementById('total-success').innerText = intel.live_success || 0;
                 document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;
             } catch (err) {
@@ -210,12 +225,12 @@
                 let data;
                 try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
                 if (data.status === "capture_succeeded_persistence_pending") {
-                    alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
+                    alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, ${formatMinorCurrency(data.amount_minor, 'USD')})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
                     window.history.replaceState({}, document.title, "/");
                     return;
                 }
                 if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
-                alert(`✅ Payment Captured! ID: ${data.id} for $${data.amount}`);
+                alert(`✅ Payment Captured! ID: ${data.id} for ${formatMinorCurrency(data.amount_minor, data.currency)}`);
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
             } catch (err) {

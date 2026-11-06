@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,8 +21,8 @@ import (
 )
 
 const (
-	expectedAmount   = 25.00
-	expectedCurrency = "USD"
+	expectedAmountMinor int64 = 2500
+	expectedCurrency          = "USD"
 )
 
 var (
@@ -39,36 +38,113 @@ var (
 	}
 
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
-		_, err := db.ExecContext(ctx, `INSERT INTO captures (id, amount, status, currency, date, is_live)
-			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
-			p.ID, p.Amount, p.Status, p.Currency, p.Date, p.IsLive)
+		_, err := db.ExecContext(ctx, `INSERT INTO captures (id, amount, amount_minor, status, currency, date, is_live)
+			VALUES ($1, ($2::NUMERIC / CASE WHEN $4 IN ('JPY', 'HUF', 'TWD') THEN 1 ELSE 100 END)::DOUBLE PRECISION,
+				$2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+			p.ID, p.AmountMinor, p.Status, p.Currency, p.Date, p.IsLive)
 		return err
 	}
 )
 
 type PaymentRecord struct {
-	ID       string  `json:"id"`
-	Amount   float64 `json:"amount"`
-	Status   string  `json:"status"`
-	Currency string  `json:"currency"`
-	Date     string  `json:"date"`
-	IsLive   bool    `json:"is_live"`
+	ID          string `json:"id"`
+	AmountMinor int64  `json:"amount_minor,string"`
+	Status      string `json:"status"`
+	Currency    string `json:"currency"`
+	Date        string `json:"date"`
+	IsLive      bool   `json:"is_live"`
 }
 
 type SpendSummary struct {
-	TotalCaptured        float64 `json:"total_captured"`
-	LiveSuccess          int     `json:"live_success"`
-	DemoCompletedCount   int     `json:"demo_completed_count"`
-	DeclineRateAvailable bool    `json:"decline_rate_available"`
-	AIInsight            string  `json:"ai_insight"`
+	TotalCapturedMinor   int64  `json:"total_captured_minor,string"`
+	LiveSuccess          int    `json:"live_success"`
+	DemoCompletedCount   int    `json:"demo_completed_count"`
+	DeclineRateAvailable bool   `json:"decline_rate_available"`
+	AIInsight            string `json:"ai_insight"`
+}
+
+func currencyExponent(currency string) int {
+	switch strings.ToUpper(currency) {
+	case "JPY", "HUF", "TWD":
+		return 0
+	default:
+		return 2
+	}
+}
+
+func parseMinorUnits(value, currency string) (int64, error) {
+	exponent := currencyExponent(currency)
+	wholePart, fractionalPart, hasDecimal := strings.Cut(value, ".")
+	if wholePart == "" || !isDigits(wholePart) {
+		return 0, fmt.Errorf("malformed amount %q", value)
+	}
+	if hasDecimal && (exponent == 0 || fractionalPart == "" || len(fractionalPart) > exponent || !isDigits(fractionalPart)) {
+		return 0, fmt.Errorf("malformed amount %q for %s", value, currency)
+	}
+	if !hasDecimal {
+		fractionalPart = ""
+	}
+	fractionalPart += strings.Repeat("0", exponent-len(fractionalPart))
+
+	whole, err := strconv.ParseInt(wholePart, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("amount %q is out of range: %w", value, err)
+	}
+	var fraction int64
+	if fractionalPart != "" {
+		fraction, err = strconv.ParseInt(fractionalPart, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("malformed amount %q: %w", value, err)
+		}
+	}
+
+	scale := int64(1)
+	for i := 0; i < exponent; i++ {
+		scale *= 10
+	}
+	const maxInt64 = int64(1<<63 - 1)
+	if whole > (maxInt64-fraction)/scale {
+		return 0, fmt.Errorf("amount %q is out of range", value)
+	}
+	return whole*scale + fraction, nil
+}
+
+func isDigits(value string) bool {
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return value != ""
+}
+
+func formatMinorUnits(amountMinor int64, currency string) string {
+	exponent := currencyExponent(currency)
+	scale := int64(1)
+	for i := 0; i < exponent; i++ {
+		scale *= 10
+	}
+	whole := amountMinor / scale
+	wholeString := strconv.FormatInt(whole, 10)
+	fraction := amountMinor % scale
+	if fraction < 0 {
+		fraction = -fraction
+	}
+	if amountMinor < 0 && whole == 0 {
+		wholeString = "-0"
+	}
+	if exponent == 0 {
+		return wholeString
+	}
+	return fmt.Sprintf("%s.%0*d", wholeString, exponent, fraction)
 }
 
 func validatePayment(p PaymentRecord) error {
 	if p.Currency != expectedCurrency {
 		return fmt.Errorf("invalid currency: expected %s, got %s", expectedCurrency, p.Currency)
 	}
-	if math.Abs(p.Amount-expectedAmount) > 0.001 {
-		return fmt.Errorf("invalid amount: expected %.2f, got %.2f", expectedAmount, p.Amount)
+	if p.AmountMinor != expectedAmountMinor {
+		return fmt.Errorf("invalid amount: expected %d minor units, got %d", expectedAmountMinor, p.AmountMinor)
 	}
 	return nil
 }
@@ -139,7 +215,7 @@ func initDB(dbURL string) error {
 		return fmt.Errorf("ping: %w", err)
 	}
 	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS captures (
-		id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL,
+		id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, amount_minor BIGINT, status TEXT NOT NULL,
 		currency TEXT NOT NULL, date TEXT NOT NULL, is_live BOOLEAN NOT NULL
 	)`)
 	return err
@@ -252,7 +328,7 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"status":         "capture_succeeded_persistence_pending",
 				"capture_id":     payment.ID,
-				"amount":         payment.Amount,
+				"amount_minor":   strconv.FormatInt(payment.AmountMinor, 10),
 				"correlation_id": correlationID,
 			})
 			return
@@ -300,7 +376,7 @@ func makeTransactionsHandler() http.HandlerFunc {
 }
 
 func getLiveRecords(ctx context.Context) ([]PaymentRecord, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, amount, status, currency, date, is_live FROM captures ORDER BY date DESC`)
+	rows, err := db.QueryContext(ctx, `SELECT id, amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +384,7 @@ func getLiveRecords(ctx context.Context) ([]PaymentRecord, error) {
 	var records []PaymentRecord
 	for rows.Next() {
 		var p PaymentRecord
-		if err := rows.Scan(&p.ID, &p.Amount, &p.Status, &p.Currency, &p.Date, &p.IsLive); err != nil {
+		if err := rows.Scan(&p.ID, &p.AmountMinor, &p.Status, &p.Currency, &p.Date, &p.IsLive); err != nil {
 			return nil, err
 		}
 		records = append(records, p)
@@ -358,7 +434,7 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 	payload := map[string]interface{}{
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]interface{}{
-			{"amount": map[string]string{"currency_code": expectedCurrency, "value": fmt.Sprintf("%.2f", expectedAmount)}},
+			{"amount": map[string]string{"currency_code": expectedCurrency, "value": formatMinorUnits(expectedAmountMinor, expectedCurrency)}},
 		},
 		"application_context": map[string]string{
 			"return_url": returnURL,
@@ -531,37 +607,37 @@ func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
 	if capture.Status != "COMPLETED" {
 		return PaymentRecord{}, fmt.Errorf("capture status %s, expected COMPLETED", capture.Status)
 	}
-	amt, err := strconv.ParseFloat(capture.Amount.Value, 64)
+	amountMinor, err := parseMinorUnits(capture.Amount.Value, capture.Amount.CurrencyCode)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("parse amount %q: %w", capture.Amount.Value, err)
+		return PaymentRecord{}, err
 	}
 	if capture.Amount.CurrencyCode == "" {
 		return PaymentRecord{}, fmt.Errorf("empty currency")
 	}
 	return PaymentRecord{
-		ID:       capture.ID,
-		Amount:   amt,
-		Status:   capture.Status,
-		Currency: capture.Amount.CurrencyCode,
-		Date:     time.Now().UTC().Format(time.RFC3339),
-		IsLive:   true,
+		ID:          capture.ID,
+		AmountMinor: amountMinor,
+		Status:      capture.Status,
+		Currency:    capture.Amount.CurrencyCode,
+		Date:        time.Now().UTC().Format(time.RFC3339),
+		IsLive:      true,
 	}, nil
 }
 
 func getDemoRecords() []PaymentRecord {
 	return []PaymentRecord{
-		{ID: "DEMO-CAP-101", Amount: 25.00, Status: "COMPLETED", Currency: "USD", Date: "2026-10-01T00:00:00Z", IsLive: false},
-		{ID: "DEMO-CAP-102", Amount: 150.50, Status: "COMPLETED", Currency: "USD", Date: "2026-10-05T00:00:00Z", IsLive: false},
-		{ID: "DEMO-CAP-104", Amount: 0.00, Status: "DECLINED", Currency: "USD", Date: "2026-10-10T00:00:00Z", IsLive: false},
+		{ID: "DEMO-CAP-101", AmountMinor: 2500, Status: "COMPLETED", Currency: "USD", Date: "2026-10-01T00:00:00Z", IsLive: false},
+		{ID: "DEMO-CAP-102", AmountMinor: 15050, Status: "COMPLETED", Currency: "USD", Date: "2026-10-05T00:00:00Z", IsLive: false},
+		{ID: "DEMO-CAP-104", AmountMinor: 0, Status: "DECLINED", Currency: "USD", Date: "2026-10-10T00:00:00Z", IsLive: false},
 	}
 }
 
 func calculateSummary(live, demo []PaymentRecord) SpendSummary {
-	var liveTotal float64
+	var liveTotal int64
 	var liveSuccess, demoCompleted int
 	for _, r := range live {
 		if r.Status == "COMPLETED" {
-			liveTotal += r.Amount
+			liveTotal += r.AmountMinor
 			liveSuccess++
 		}
 	}
@@ -570,11 +646,11 @@ func calculateSummary(live, demo []PaymentRecord) SpendSummary {
 			demoCompleted++
 		}
 	}
-	return SpendSummary{TotalCaptured: liveTotal, LiveSuccess: liveSuccess, DemoCompletedCount: demoCompleted, DeclineRateAvailable: false}
+	return SpendSummary{TotalCapturedMinor: liveTotal, LiveSuccess: liveSuccess, DemoCompletedCount: demoCompleted, DeclineRateAvailable: false}
 }
 
 func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%.2f (%d payments), Demo %d. Decline rate NOT TRACKED. Give 1-sentence actionable insight. Max 20 words.`, summary.TotalCaptured, summary.LiveSuccess, summary.DemoCompletedCount)
+	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%s (%d payments), Demo %d. Decline rate NOT TRACKED. Give 1-sentence actionable insight. Max 20 words.`, formatMinorUnits(summary.TotalCapturedMinor, expectedCurrency), summary.LiveSuccess, summary.DemoCompletedCount)
 
 	payload := map[string]interface{}{
 		"model":       "openai/gpt-oss-20b",
