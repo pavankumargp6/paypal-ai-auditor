@@ -20,6 +20,7 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 
 - Phase 1.0 follow-up is committed. Next: the user reviews the revised `migrations/001_amount_minor.sql`. Do not connect to Render or execute the migration until the user explicitly authorizes it.
 - Current local checks: `gofmt -l .` returned no files, `go vet ./...` exited 0, and `go test -race -count=1 ./...` passed with `ok paypal-ai-auditor 2.270s`; `cmd/migrate` compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
+- GitHub Actions run [Go CI #42201501029](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42201501029) for commit `3457d8a3fc6484847f0c577748e92c5becd30034` completed successfully on 2026-11-06. Its PostgreSQL 16 service and dedicated `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` were configured for `go test -race -count=1 ./...`; all three PostgreSQL integration tests ran (they skip only when that variable is empty): `TestPostgresAdvisoryLockSerializesSameOrder`, `TestPostgresLegacyMinorFallback`, and `TestPostgresLockPersistenceFailureRetryReconciles`.
 - After review/application as directed, continue Phase 1.1 typed PayPal errors, then attempts and webhooks. Phase 2 decline classification still requires checking PayPal documentation for buyer-recoverable semantics before final wording.
 
 ## Decisions and reasons
@@ -35,7 +36,7 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 ## Known issues and unverified items
 
 - The revised migration has not been run against any database. Render has not been contacted during this follow-up.
-- The dedicated PostgreSQL test URL is unset locally; the advisory-lock, legacy-fallback, and actual-lock persistence-retry tests skip locally. CI is configured to run them against a PostgreSQL service, but that workflow has not yet completed.
+- The dedicated PostgreSQL test URL is unset locally; the advisory-lock, legacy-fallback, and actual-lock persistence-retry tests skip locally. They ran against the PostgreSQL 16 service in successful CI run #42201501029.
 - The transaction-aware retry path is covered locally with mocked PayPal and a simulated persistence failure. The env-gated integration test exercises it with a real PostgreSQL advisory-lock transaction and mocked PayPal when the dedicated test DB is available.
 - PayPal negative-test mock responses are not actual buyer/card decline transactions. `INSUFFICIENT_FUNDS` classification remains unverified.
 - The app has no authentication. Live payments are out of scope; use only PayPal Sandbox credentials.
