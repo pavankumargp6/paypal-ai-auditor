@@ -19,6 +19,9 @@ func openPostgresIntegrationDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dbURL := strings.TrimSpace(os.Getenv("PAYPAL_AI_AUDITOR_TEST_DATABASE_URL"))
 	if dbURL == "" {
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("CI")), "true") {
+			t.Fatal("PAYPAL_AI_AUDITOR_TEST_DATABASE_URL is required in CI")
+		}
 		t.Skip("set PAYPAL_AI_AUDITOR_TEST_DATABASE_URL to run PostgreSQL integration tests")
 	}
 	testDB, err := sql.Open("postgres", dbURL)
