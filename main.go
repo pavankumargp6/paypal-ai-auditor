@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -122,6 +124,11 @@ var (
 		"paypal.com":             true,
 	}
 
+	insightCache = struct {
+		sync.Mutex
+		entries map[[32]byte]*insightCacheEntry
+	}{entries: make(map[[32]byte]*insightCacheEntry)}
+
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
 		args := []any{p.ID, p.AmountMinor, p.Status, p.Currency, p.Date, p.IsLive}
 		if tx, ok := ctx.Value(captureTransactionContextKey{}).(*sql.Tx); ok {
@@ -140,6 +147,12 @@ type PaymentRecord struct {
 	Currency    string `json:"currency"`
 	Date        string `json:"date"`
 	IsLive      bool   `json:"is_live"`
+}
+
+type insightCacheEntry struct {
+	insight   string
+	expiresAt time.Time
+	ready     chan struct{}
 }
 
 type SpendSummary struct {
@@ -254,6 +267,28 @@ func validateApprovalURL(rawURL string) error {
 	return nil
 }
 
+func payPalReturnCancelURLs(base string) (string, string, error) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "http://localhost:8080"
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", "", fmt.Errorf("APP_BASE_URL must be an absolute HTTP or HTTPS URL")
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/"
+	u.Fragment = ""
+	query := u.Query()
+	query.Set("success", "true")
+	u.RawQuery = query.Encode()
+	returnURL := u.String()
+	query = u.Query()
+	query.Del("success")
+	query.Set("cancel", "true")
+	u.RawQuery = query.Encode()
+	return returnURL, u.String(), nil
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -328,8 +363,13 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 			return
 		}
 
-		returnURL := "https://paypal-ai-auditor.onrender.com/?success=true"
-		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL)
+		returnURL, cancelURL, err := payPalReturnCancelURLs(os.Getenv("APP_BASE_URL"))
+		if err != nil {
+			log.Printf("create-order callback URL: %v", err)
+			sendJSONError(w, "Invalid APP_BASE_URL", http.StatusInternalServerError)
+			return
+		}
+		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL, cancelURL)
 		if err != nil {
 			log.Printf("create-order create: %v", err)
 			sendJSONError(w, "Order creation failed", http.StatusBadGateway)
@@ -494,10 +534,82 @@ func makeSpendHandler(groqKey string) http.HandlerFunc {
 		}
 
 		summary := calculateSummary(liveRecords, getDemoRecords())
-		summary.AIInsight = generateAIInsight(ctx, groqKey, summary)
+		summary.AIInsight = cachedAIInsight(ctx, groqKey, summary)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(summary)
+	}
+}
+
+func cachedAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
+	key, err := insightSummaryKey(summary)
+	if err != nil {
+		return generateAIInsight(ctx, apiKey, summary)
+	}
+
+	for {
+		insightCache.Lock()
+		now := time.Now()
+		entry, exists := insightCache.entries[key]
+		if exists && entry.ready != nil {
+			ready := entry.ready
+			insightCache.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-ctx.Done():
+				return "AI insight unavailable."
+			}
+		}
+		if exists && now.Before(entry.expiresAt) {
+			value := entry.insight
+			insightCache.Unlock()
+			return value
+		}
+		entry = &insightCacheEntry{ready: make(chan struct{})}
+		insightCache.entries[key] = entry
+		insightCache.Unlock()
+
+		insight := generateAIInsight(ctx, apiKey, summary)
+		insightCache.Lock()
+		entry.insight = insight
+		entry.expiresAt = time.Now().Add(60 * time.Second)
+		close(entry.ready)
+		entry.ready = nil
+		pruneInsightCache(time.Now(), key)
+		insightCache.Unlock()
+		return insight
+	}
+}
+
+func insightSummaryKey(summary SpendSummary) ([32]byte, error) {
+	keySummary := summary
+	keySummary.AIInsight = ""
+	encoded, err := json.Marshal(keySummary)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+func pruneInsightCache(now time.Time, keepKey [32]byte) {
+	for cachedKey, cached := range insightCache.entries {
+		if cached.ready == nil && now.After(cached.expiresAt) {
+			delete(insightCache.entries, cachedKey)
+		}
+	}
+	if len(insightCache.entries) <= 128 {
+		return
+	}
+	var oldestKey [32]byte
+	var oldest time.Time
+	for cachedKey, cached := range insightCache.entries {
+		if cached.ready == nil && cachedKey != keepKey && (oldest.IsZero() || cached.expiresAt.Before(oldest)) {
+			oldestKey, oldest = cachedKey, cached.expiresAt
+		}
+	}
+	if !oldest.IsZero() {
+		delete(insightCache.entries, oldestKey)
 	}
 }
 
@@ -573,7 +685,11 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 	return result.AccessToken, nil
 }
 
-func createPayPalOrder(ctx context.Context, token, returnURL string) (string, string, error) {
+func createPayPalOrder(ctx context.Context, token, returnURL string, cancelURLs ...string) (string, string, error) {
+	cancelURL := returnURL
+	if len(cancelURLs) != 0 {
+		cancelURL = cancelURLs[0]
+	}
 	payload := map[string]interface{}{
 		"intent": "CAPTURE",
 		"purchase_units": []map[string]interface{}{
@@ -581,7 +697,7 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 		},
 		"application_context": map[string]string{
 			"return_url": returnURL,
-			"cancel_url": "https://paypal-ai-auditor.onrender.com/?cancel=true",
+			"cancel_url": cancelURL,
 		},
 	}
 	jsonPayload, err := json.Marshal(payload)
@@ -736,9 +852,11 @@ func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
 		PurchaseUnits []struct {
 			Payments struct {
 				Captures []struct {
-					ID     string `json:"id"`
-					Status string `json:"status"`
-					Amount struct {
+					ID         string `json:"id"`
+					Status     string `json:"status"`
+					CreateTime string `json:"create_time"`
+					UpdateTime string `json:"update_time"`
+					Amount     struct {
 						Value        string `json:"value"`
 						CurrencyCode string `json:"currency_code"`
 					} `json:"amount"`
@@ -766,12 +884,23 @@ func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
 	if capture.Amount.CurrencyCode == "" {
 		return PaymentRecord{}, fmt.Errorf("empty currency")
 	}
+	timestamp := capture.CreateTime
+	if timestamp == "" {
+		timestamp = capture.UpdateTime
+	}
+	if timestamp == "" {
+		return PaymentRecord{}, fmt.Errorf("capture response has no create_time or update_time")
+	}
+	capturedAt, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return PaymentRecord{}, fmt.Errorf("invalid capture timestamp: %w", err)
+	}
 	return PaymentRecord{
 		ID:          capture.ID,
 		AmountMinor: amountMinor,
 		Status:      capture.Status,
 		Currency:    capture.Amount.CurrencyCode,
-		Date:        time.Now().UTC().Format(time.RFC3339),
+		Date:        capturedAt.UTC().Format(time.RFC3339Nano),
 		IsLive:      true,
 	}, nil
 }

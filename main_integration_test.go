@@ -103,7 +103,7 @@ func TestPostgresLockPersistenceFailureRetryReconciles(t *testing.T) {
 	usePostgresIntegrationDB(t)
 	setOrderLock(t, withPostgresOrderAdvisoryLock)
 	saveTransport(t)
-	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPDBRETRY","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPDBRETRY","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	orderCompleted := false
 	captureCalls := 0
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {

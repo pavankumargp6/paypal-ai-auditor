@@ -1,6 +1,6 @@
 # PayPal Spend Intelligence Agent
 
-An AI-powered dashboard for merchants to view verified PayPal Sandbox payments, track live revenue, and receive actionable insights from Groq (Llama 3).
+An AI-powered dashboard for merchants to view verified PayPal Sandbox payments, track live revenue, and receive actionable insights from Groq (`openai/gpt-oss-20b`).
 
 ## Architecture
 - **Backend:** Go (standard library only, no heavy frameworks).
@@ -11,7 +11,8 @@ An AI-powered dashboard for merchants to view verified PayPal Sandbox payments, 
 
 ## Setup & Environment Variables
 Required variables:
-- `DATABASE_URL` (PostgreSQL connection string)
+- `DATABASE_URL` (PostgreSQL connection string; see `.env.example`)
+- `APP_BASE_URL` (application base URL used for PayPal return/cancel redirects; defaults to `http://localhost:8080`)
 - `PAYPAL_CLIENT_ID`
 - `PAYPAL_CLIENT_SECRET`
 - `GROQ_API_KEY`
@@ -24,11 +25,16 @@ Required variables:
 5. Frontend calls `/api/capture-order`.
 6. Backend verifies status is `APPROVED`, captures funds, validates amount/currency, and saves to PostgreSQL.
 
-## Error Handling & Limitations
+## Error Handling
 - **Reconciliation:** If an order is already `COMPLETED`, the backend safely reconciles instead of failing.
 - **Persistence Failures:** If PayPal succeeds but DB insert fails, the API returns `capture_succeeded_persistence_pending`.
-- **Decline Rate:** We only persist successful captures. A true decline rate requires a separate `attempts` table (not implemented).
-- **Demo Data:** Synthetic records are clearly labeled in the UI and excluded from live revenue calculations.
+
+## Limitations
+- **Sandbox only:** Payments use PayPal Sandbox; do not use this app for live transactions.
+- **No authentication:** API endpoints do not authenticate users and must not be exposed as a production merchant system.
+- **Sandbox reason codes:** Reason codes come from sandbox negative testing and do not establish production decline behavior.
+- **Synthetic data:** Synthetic records are labeled in the UI and excluded from live metrics.
+- **Decline Rate:** A true decline rate requires persisted payment attempts; it is not available until the attempts table is installed.
 
 ## Testing
 Run the unit tests (which mock HTTP and do not hit real PayPal):

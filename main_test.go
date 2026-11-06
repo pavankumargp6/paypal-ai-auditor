@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type mockRoundTripper func(*http.Request) (*http.Response, error)
@@ -229,6 +231,23 @@ func TestValidateApprovalURL(t *testing.T) {
 				t.Errorf("validateApprovalURL(%q) err=%v, wantErr=%v", tc.url, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestPayPalReturnCancelURLs(t *testing.T) {
+	returnURL, cancelURL, err := payPalReturnCancelURLs("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returnURL != "http://localhost:8080/?success=true" || cancelURL != "http://localhost:8080/?cancel=true" {
+		t.Fatalf("default callback URLs = %q / %q", returnURL, cancelURL)
+	}
+	returnURL, cancelURL, err = payPalReturnCancelURLs("https://merchant.example/app/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returnURL != "https://merchant.example/app/?success=true" || cancelURL != "https://merchant.example/app/?cancel=true" {
+		t.Fatalf("configured callback URLs = %q / %q", returnURL, cancelURL)
 	}
 }
 
@@ -488,6 +507,77 @@ func TestParseCaptureFromBody_NotCompleted(t *testing.T) {
 	}
 }
 
+func TestParseCaptureUsesPayPalTimestamps(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		timestamp string
+		field     string
+	}{
+		{name: "create_time preferred", timestamp: "2026-11-06T12:00:00Z", field: "create_time"},
+		{name: "update_time fallback", timestamp: "2026-11-06T13:00:00+01:00", field: "update_time"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"purchase_units":[{"payments":{"captures":[{"id":"CAPTIME","status":"COMPLETED","%s":%q,"amount":{"value":"25.00","currency_code":"USD"}}]}}]}`, tc.field, tc.timestamp)
+			payment, err := parseCaptureFromBody([]byte(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if payment.Date != "2026-11-06T12:00:00Z" {
+				t.Fatalf("capture date = %q, want PayPal timestamp normalized to UTC", payment.Date)
+			}
+		})
+	}
+}
+
+func TestCachedAIInsightIsKeyedAndExpiresAfterOneMinute(t *testing.T) {
+	insightCache.Lock()
+	insightCache.entries = make(map[[32]byte]*insightCacheEntry)
+	insightCache.Unlock()
+	t.Cleanup(func() {
+		insightCache.Lock()
+		insightCache.entries = make(map[[32]byte]*insightCacheEntry)
+		insightCache.Unlock()
+	})
+	saveTransport(t)
+	calls := 0
+	httpClient.Transport = mockRoundTripper(func(*http.Request) (*http.Response, error) {
+		calls++
+		return resp(http.StatusOK, `{"choices":[{"message":{"content":"Cached insight"}}]}`), nil
+	})
+
+	ctx := context.Background()
+	summary := SpendSummary{TotalCapturedMinor: 17500, LiveSuccess: 7}
+	if got := cachedAIInsight(ctx, "test-key", summary); got != "Cached insight" {
+		t.Fatalf("first insight = %q", got)
+	}
+	if got := cachedAIInsight(ctx, "test-key", summary); got != "Cached insight" {
+		t.Fatalf("cached insight = %q", got)
+	}
+	if calls != 1 {
+		t.Fatalf("Groq calls for identical summary = %d, want 1", calls)
+	}
+
+	key, err := insightSummaryKey(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insightCache.Lock()
+	entry := insightCache.entries[key]
+	insightCache.Unlock()
+	if entry == nil || !entry.expiresAt.After(time.Now()) || entry.expiresAt.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("cache entry expiry = %+v, want an expiry within 60 seconds", entry)
+	}
+
+	changedSummary := summary
+	changedSummary.LiveSuccess++
+	if got := cachedAIInsight(ctx, "test-key", changedSummary); got != "Cached insight" {
+		t.Fatalf("changed-summary insight = %q", got)
+	}
+	if calls != 2 {
+		t.Fatalf("Groq calls after summary changed = %d, want 2", calls)
+	}
+}
+
 func setOrderLock(t *testing.T, lock func(context.Context, string, func(context.Context) error) error) {
 	t.Helper()
 	original := orderLock
@@ -498,7 +588,7 @@ func setOrderLock(t *testing.T, lock func(context.Context, string, func(context.
 func TestCaptureOrderHandler_AlreadyCapturedResponseReconciles(t *testing.T) {
 	saveTransport(t)
 	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error { return fn(ctx) })
-	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	getCount := 0
 	captureCalls := 0
 	requestIDs := []string{}
@@ -560,7 +650,7 @@ func TestCaptureOrderHandler_ConcurrentRequestsCaptureOnce(t *testing.T) {
 		return fn(ctx)
 	})
 
-	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	var stateMu sync.Mutex
 	orderCompleted := false
 	captureCalls := 0
@@ -670,7 +760,7 @@ func TestCaptureOrderHandler_UnapprovedOrder(t *testing.T) {
 }
 
 func TestCaptureOrderHandler_WrongAmount(t *testing.T) {
-	badCapture := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"X","status":"COMPLETED","amount":{"value":"999.00","currency_code":"USD"}}]}}]}`
+	badCapture := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"X","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"999.00","currency_code":"USD"}}]}}]}`
 	mockEndpoints(t, `{"status":"APPROVED"}`, badCapture, "")
 	handler := makeCaptureOrderHandler("fake", "fake")
 	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
@@ -690,7 +780,7 @@ func TestLiveRecordsQueryUsesLegacyMinorFallback(t *testing.T) {
 func TestCaptureOrderHandler_PersistenceFailureRetryReconciles(t *testing.T) {
 	saveTransport(t)
 	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error { return fn(ctx) })
-	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPRETRY","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPRETRY","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	orderCompleted := false
 	captureCalls := 0
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -749,7 +839,7 @@ func TestCaptureOrderHandler_PersistenceFailureRetryReconciles(t *testing.T) {
 }
 
 func TestCaptureOrderHandler_DBFailure(t *testing.T) {
-	goodCapture := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAP123","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	goodCapture := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAP123","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	mockEndpoints(t, `{"status":"APPROVED"}`, goodCapture, "")
 
 	orig := persistCapture
@@ -773,7 +863,7 @@ func TestCaptureOrderHandler_DBFailure(t *testing.T) {
 }
 
 func TestCaptureOrderHandler_RetryReconciles(t *testing.T) {
-	reconcileBody := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAP123","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	reconcileBody := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAP123","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	mockEndpoints(t, `{"status":"COMPLETED"}`, "", reconcileBody)
 
 	persistCalled := 0
