@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -51,8 +51,83 @@
     </style>
 </head>
 <body>
+<!-- LEAKAGE SCORE UI INJECTED BY POWERSHELL -->
+<div id="leakage-score-section" style="background: #fff; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 1200px; font-family: sans-serif; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+    <h2 style="margin-top: 0; color: #333;">Revenue Leakage Score</h2>
+    <div style="display: flex; gap: 40px;">
+        <div><div style="color: #666; font-size: 14px;">Lost</div><div style="font-size: 28px; font-weight: bold; color: #d32f2f;" id="score-lost">.00</div></div>
+        <div><div style="color: #666; font-size: 14px;">Recoverable</div><div style="font-size: 28px; font-weight: bold; color: #f57c00;" id="score-recoverable">.00</div></div>
+        <div><div style="color: #666; font-size: 14px;">Recovered</div><div style="font-size: 28px; font-weight: bold; color: #388e3c;" id="score-recovered">.00</div></div>
+    </div>
+    <div style="margin-top: 15px;">
+        <button onclick="seedDemo()" style="padding: 8px 16px; background: #0070ba; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Seed Demo Leak (125)</button>
+    </div>
+    <div id="findings-list" style="margin-top: 20px;"></div>
+</div>
+<script>
+async function updateLeakageScore() {
+    try {
+        const res = await fetch('/api/findings/leakage-score');
+        const data = await res.json();
+        const lost = data.simulated_lost_minor || data.lost_minor || 0;
+        const rec = data.simulated_recoverable_minor || data.recoverable_minor || 0;
+        const recov = data.simulated_recovered_minor || data.recovered_minor || 0;
+        document.getElementById('score-lost').innerText = $;
+        document.getElementById('score-recoverable').innerText = $;
+        document.getElementById('score-recovered').innerText = $;
+    } catch (e) { console.error("Score error:", e); }
+}
+async function updateFindings() {
+    try {
+        const res = await fetch('/api/findings');
+        const findings = await res.json();
+        const list = document.getElementById('findings-list');
+        list.innerHTML = '';
+        
+        // Only show open/acknowledged findings
+        const activeFindings = findings.filter(f => f.status === 'open' || f.status === 'acknowledged');
+        
+        if (!activeFindings || activeFindings.length === 0) {
+            list.innerHTML = '<p style="color: #388e3c; font-weight: bold;">✅ No active leaks detected.</p>';
+            return;
+        }
+        activeFindings.forEach(f => {
+            const div = document.createElement('div');
+            div.style = "padding: 12px; border-left: 4px solid #f57c00; background: #fff8e1; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border-radius: 4px;";
+            div.innerHTML = 
+                <div>
+                    <strong style="text-transform: capitalize; color: #d32f2f;"></strong><br>
+                    <span style="color: #666; font-size: 13px;">Amount: 1{(f.amount_minor / 100).toFixed(2)} | Status: </span>
+                </div>
+                <button onclick="approveAction()" style="padding: 8px 16px; background: #0070ba; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Approve Refund</button>
+            ;
+            list.appendChild(div);
+        });
+    } catch (e) { console.error("Findings error:", e); }
+}
+async function seedDemo() {
+    await fetch('/api/findings/seed-demo', { method: 'POST' });
+    updateLeakageScore(); updateFindings();
+}
+async function approveAction(findingId) {
+    try {
+        const propRes = await fetch(/api/findings//action, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action_type: "flag_refund", actor: "Demo User"})
+        });
+        if (!propRes.ok) throw new Error("Propose failed");
+        const propData = await propRes.json();
+        await fetch(/api/actions//approve, { method: 'POST' });
+        
+        // Refresh UI
+        updateLeakageScore(); updateFindings();
+    } catch (e) { alert("Error approving action: " + e.message); }
+}
+document.addEventListener("DOMContentLoaded", () => { updateLeakageScore(); updateFindings(); });
+</script>
+<!-- END LEAKAGE SCORE UI -->
     <div class="header">
-        <h1>💳 PayPal Spend Intelligence Agent</h1>
+        <h1>ðŸ’³ PayPal Spend Intelligence Agent</h1>
         <div style="text-align:right">
             <div class="badge" id="ai-insight" style="background:#e0f2fe; color:#0369a1; padding:10px 20px; border-radius:20px; font-weight:600;">Loading AI Insights...</div>
             <div id="ai-insight-citations" style="margin-top:6px; color:#64748b; font-size:0.75rem;"></div>
@@ -93,7 +168,7 @@
         <div class="findings-table-wrap">
             <table class="findings-table">
                 <thead><tr><th>Finding</th><th>Amount</th><th>Capture IDs / Evidence</th><th>Explanation</th><th>Action</th></tr></thead>
-                <tbody id="findings-body"><tr><td colspan="5" class="muted">Loading findings…</td></tr></tbody>
+                <tbody id="findings-body"><tr><td colspan="5" class="muted">Loading findingsâ€¦</td></tr></tbody>
             </table>
         </div>
     </section>
@@ -132,7 +207,7 @@
             <table style="width:100%; border-collapse:collapse; margin-bottom:20px;">
                 <tr>
                     <td style="padding:8px 0; color:#64748b;">Item</td>
-                    <td style="padding:8px 0; text-align:right; font-weight:600;">PayPal Spend Intelligence Agent — Sandbox Test Payment</td>
+                    <td style="padding:8px 0; text-align:right; font-weight:600;">PayPal Spend Intelligence Agent â€” Sandbox Test Payment</td>
                 </tr>
                 <tr>
                     <td style="padding:8px 0; color:#64748b;">Quantity</td>
@@ -229,16 +304,16 @@
                 applyFilter();
             } catch (err) {
                 console.error("[transactions] FAILED:", err);
-                document.getElementById('ai-insight').innerText = "❌ Transactions failed: " + err.message;
+                document.getElementById('ai-insight').innerText = "âŒ Transactions failed: " + err.message;
             }
 
             try {
                 const intelRes = await fetch('/api/spend-intelligence');
                 if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
                 const intel = await intelRes.json();
-                document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
+                document.getElementById('ai-insight').innerText = "ðŸ¤– " + intel.ai_insight;
                 document.getElementById('ai-insight-citations').innerText = (intel.ai_insight_citations || [])
-                    .map(c => `Order ${c.order_id} · Capture ${c.capture_id}`).join(" | ");
+                    .map(c => `Order ${c.order_id} Â· Capture ${c.capture_id}`).join(" | ");
                 document.getElementById('total-revenue').innerText = formatMinorCurrency(intel.total_captured_minor, 'USD');
                 document.getElementById('total-success').innerText = intel.live_success || 0;
                 document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;
@@ -247,7 +322,7 @@
                     : "No data yet";
             } catch (err) {
                 console.error("[metrics] FAILED:", err);
-                document.getElementById('ai-insight').innerText = "⚠️ AI metrics unavailable (grid still works)";
+                document.getElementById('ai-insight').innerText = "âš ï¸ AI metrics unavailable (grid still works)";
             }
 
             await refreshFindingsDashboard();
@@ -337,7 +412,7 @@
             const button = document.getElementById('seed-demo-btn');
             const status = document.getElementById('findings-status');
             button.disabled = true;
-            status.innerText = 'Seeding a simulated finding…';
+            status.innerText = 'Seeding a simulated findingâ€¦';
             try {
                 const result = await apiJSON('/api/findings/seed-demo', { method: 'POST' });
                 status.innerText = result.created
@@ -354,7 +429,7 @@
         async function approveFinding(findingID, button) {
             const feedback = button.parentElement.querySelector('.action-feedback');
             button.disabled = true;
-            feedback.innerText = 'Recording action…';
+            feedback.innerText = 'Recording actionâ€¦';
             try {
                 const action = await apiJSON(`/api/findings/${encodeURIComponent(findingID)}/action`, {
                     method: 'POST',
@@ -374,14 +449,14 @@
 
         function applyFilter() {
             if (!spendGridApi) {
-                console.error("[filter] spendGridApi is null — cannot set rowData");
+                console.error("[filter] spendGridApi is null â€” cannot set rowData");
                 return;
             }
             const filter = document.getElementById('source-filter').value;
             let filteredData = window.allTransactions || [];
             if (filter === 'live') filteredData = filteredData.filter(r => r.is_live === true);
             else if (filter === 'demo') filteredData = filteredData.filter(r => r.is_live === false);
-            console.log("[filter]", filter, "→", filteredData.length, "rows");
+            console.log("[filter]", filter, "â†’", filteredData.length, "rows");
             spendGridApi.setGridOption('rowData', filteredData);
         }
 
@@ -410,7 +485,7 @@
         }
 
         async function captureOrder(orderID) {
-            document.getElementById('ai-insight').innerText = "🤖 Verifying and capturing payment...";
+            document.getElementById('ai-insight').innerText = "ðŸ¤– Verifying and capturing payment...";
             try {
                 const res = await fetch('/api/capture-order', {
                     method: 'POST',
@@ -420,12 +495,12 @@
                 let data;
                 try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
                 if (data.status === "capture_succeeded_persistence_pending") {
-                    alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, ${formatMinorCurrency(data.amount_minor, 'USD')})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
+                    alert(`âš ï¸ Payment captured at PayPal (ID: ${data.capture_id}, ${formatMinorCurrency(data.amount_minor, 'USD')})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
                     window.history.replaceState({}, document.title, "/");
                     return;
                 }
                 if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
-                alert(`✅ Payment Captured! ID: ${data.id} for ${formatMinorCurrency(data.amount_minor, data.currency)}`);
+                alert(`âœ… Payment Captured! ID: ${data.id} for ${formatMinorCurrency(data.amount_minor, data.currency)}`);
                 window.history.replaceState({}, document.title, "/");
                 refreshDashboard();
             } catch (err) {
@@ -437,72 +512,5 @@
     </script>
 </body>
 </html>
-<!-- LEAKAGE SCORE UI INJECTED BY POWERSHELL -->
-<div id="leakage-score-section" style="background: #fff; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 1200px; font-family: sans-serif;">
-    <h2 style="margin-top: 0; color: #333;">Revenue Leakage Score</h2>
-    <div style="display: flex; gap: 40px;">
-        <div><div style="color: #666; font-size: 14px;">Lost</div><div style="font-size: 28px; font-weight: bold; color: #d32f2f;" id="score-lost">.00</div></div>
-        <div><div style="color: #666; font-size: 14px;">Recoverable</div><div style="font-size: 28px; font-weight: bold; color: #f57c00;" id="score-recoverable">.00</div></div>
-        <div><div style="color: #666; font-size: 14px;">Recovered</div><div style="font-size: 28px; font-weight: bold; color: #388e3c;" id="score-recovered">.00</div></div>
-    </div>
-    <div style="margin-top: 15px;">
-        <button onclick="seedDemo()" style="padding: 8px 16px; background: #0070ba; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Seed Demo Leak (125)</button>
-    </div>
-    <div id="findings-list" style="margin-top: 20px;"></div>
-</div>
-<script>
-async function updateLeakageScore() {
-    try {
-        const res = await fetch('/api/findings/leakage-score');
-        const data = await res.json();
-        const lost = data.simulated_lost_minor || data.lost_minor || 0;
-        const rec = data.simulated_recoverable_minor || data.recoverable_minor || 0;
-        const recov = data.simulated_recovered_minor || data.recovered_minor || 0;
-        document.getElementById('score-lost').innerText = $;
-        document.getElementById('score-recoverable').innerText = $;
-        document.getElementById('score-recovered').innerText = $;
-    } catch (e) { console.error("Score error:", e); }
-}
-async function updateFindings() {
-    try {
-        const res = await fetch('/api/findings');
-        const findings = await res.json();
-        const list = document.getElementById('findings-list');
-        list.innerHTML = '';
-        if (!findings || findings.length === 0) {
-            list.innerHTML = '<p style="color: #666;">No active leaks detected.</p>';
-            return;
-        }
-        findings.forEach(f => {
-            const div = document.createElement('div');
-            div.style = "padding: 10px; border: 1px solid #eee; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border-radius: 4px;";
-            div.innerHTML = 
-                <div>
-                    <strong style="text-transform: capitalize; color: #333;"></strong><br>
-                    <span style="color: #666; font-size: 12px;">Amount: 1{(f.amount_minor / 100).toFixed(2)} | Status: </span>
-                </div>
-                <button onclick="approveAction()" style="padding: 6px 12px; background: #ffc439; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Approve Refund</button>
-            ;
-            list.appendChild(div);
-        });
-    } catch (e) { console.error("Findings error:", e); }
-}
-async function seedDemo() {
-    await fetch('/api/findings/seed-demo', { method: 'POST' });
-    updateLeakageScore(); updateFindings();
-}
-async function approveAction(findingId) {
-    try {
-        const propRes = await fetch(/api/findings//action, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({action_type: "flag_refund", actor: "Demo User"})
-        });
-        if (!propRes.ok) throw new Error("Propose failed");
-        const propData = await propRes.json();
-        await fetch(/api/actions//approve, { method: 'POST' });
-        updateLeakageScore(); updateFindings();
-    } catch (e) { alert("Error approving action: " + e.message); }
-}
-document.addEventListener("DOMContentLoaded", () => { updateLeakageScore(); updateFindings(); });
-</script>
-<!-- END LEAKAGE SCORE UI -->
+
+
