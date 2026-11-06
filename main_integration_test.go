@@ -215,6 +215,112 @@ func TestPostgresWebhookFailureCanBeRetriedAndProcessedOnce(t *testing.T) {
 	}
 }
 
+func TestPostgresConcurrentDuplicateWebhookPostsWriteOneAttempt(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	saveTransport(t)
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/v1/oauth2/token":
+			return resp(http.StatusOK, `{"access_token":"integration-token"}`), nil
+		case "/v1/notifications/verify-webhook-signature":
+			return resp(http.StatusOK, `{"verification_status":"SUCCESS"}`), nil
+		default:
+			return resp(http.StatusNotFound, `{}`), nil
+		}
+	})
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	eventID, captureID, orderID := "integration-concurrent-webhook-"+suffix, "INTEGRATION-CONCURRENT-CAPTURE-"+suffix, "INTEGRATION-CONCURRENT-ORDER-"+suffix
+	body := fmt.Sprintf(`{"id":%q,"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":%q,"amount":{"value":"25.00","currency_code":"USD"},"supplementary_data":{"related_ids":{"order_id":%q}}}}`, eventID, captureID, orderID)
+	t.Cleanup(func() {
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM attempts WHERE capture_id = $1`, captureID)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+	})
+
+	previousWriter := insertWebhookAttempt
+	firstInsertEntered := make(chan struct{})
+	releaseFirstInsert := make(chan struct{})
+	var attemptCalls atomic.Int32
+	insertWebhookAttempt = func(ctx context.Context, execer webhookExecer, attempt PaymentAttempt) error {
+		if attemptCalls.Add(1) == 1 {
+			close(firstInsertEntered)
+			<-releaseFirstInsert
+		}
+		return previousWriter(ctx, execer, attempt)
+	}
+	t.Cleanup(func() {
+		insertWebhookAttempt = previousWriter
+		select {
+		case <-releaseFirstInsert:
+		default:
+			close(releaseFirstInsert)
+		}
+	})
+
+	handler := makePayPalWebhookHandler("client", "secret", "WH-INTEGRATION")
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	deliver := func() {
+		req := validWebhookRequest(body)
+		req.URL.Path = "/webhooks/paypal"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		responses <- w
+	}
+	go deliver()
+	select {
+	case <-firstInsertEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first webhook did not reach attempt insertion")
+	}
+	go deliver()
+
+	// Wait until the second request is visibly blocked on the first transaction's
+	// SELECT ... FOR UPDATE before letting the first transaction commit.
+	lockWaitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		var waiting int
+		err := testDB.QueryRowContext(lockWaitCtx, `SELECT COUNT(*) FROM pg_stat_activity
+			WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock'
+			AND query ILIKE '%SELECT event_type, payload, processed_at FROM webhook_events%'`).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("check concurrent webhook row lock: %v", err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case <-lockWaitCtx.Done():
+			t.Fatal("second webhook did not block on the receipt row lock")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if got := attemptCalls.Load(); got != 1 {
+		t.Fatalf("attempt insert calls while first delivery holds the row lock = %d, want 1", got)
+	}
+	close(releaseFirstInsert)
+	for i := 0; i < 2; i++ {
+		select {
+		case w := <-responses:
+			if w.Code != http.StatusOK {
+				t.Errorf("concurrent webhook response = %d %s, want 200", w.Code, w.Body.String())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent webhook response")
+		}
+	}
+	if got := attemptCalls.Load(); got != 1 {
+		t.Fatalf("attempt insert calls = %d, want exactly one", got)
+	}
+	var attemptRows int
+	if err := testDB.QueryRow(`SELECT COUNT(*) FROM attempts WHERE capture_id = $1 AND stage = 'webhook'`, captureID).Scan(&attemptRows); err != nil {
+		t.Fatalf("count attempts from concurrent webhook posts: %v", err)
+	}
+	if attemptRows != 1 {
+		t.Fatalf("attempt rows from two concurrent POSTs = %d, want exactly one", attemptRows)
+	}
+}
+
 func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {
 	testDB := usePostgresIntegrationDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
