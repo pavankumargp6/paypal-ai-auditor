@@ -403,8 +403,23 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	if err := json.Unmarshal(approval.Body.Bytes(), &executed); err != nil {
 		t.Fatalf("decode executed action: %v", err)
 	}
-	if executed.Status != "executed" || executed.MoneyMoved || !strings.Contains(string(executed.Result), `"money_moved": false`) {
+	var auditResult struct {
+		MoneyMoved bool `json:"money_moved"`
+		Events     []struct {
+			Status     string `json:"status"`
+			MoneyMoved bool   `json:"money_moved"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(executed.Result, &auditResult); err != nil {
+		t.Fatalf("decode executed audit result: %v", err)
+	}
+	if executed.Status != "executed" || executed.MoneyMoved || auditResult.MoneyMoved || len(auditResult.Events) != 3 {
 		t.Fatalf("executed action response = %+v", executed)
+	}
+	for _, event := range auditResult.Events {
+		if event.MoneyMoved {
+			t.Fatalf("audit event %q reports money moved", event.Status)
+		}
 	}
 	var findingStatus string
 	if err := testDB.QueryRowContext(ctx, `SELECT status FROM findings WHERE id = $1`, findingID).Scan(&findingStatus); err != nil {
