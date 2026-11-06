@@ -16,13 +16,14 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 - `0b43af7 fix: preserve legacy captures and verify lock recovery` — hardened the additive migration, added the legacy-row `COALESCE` fallback, set DB pool limits, wrote capture rows on the advisory-lock transaction, added env-gated PostgreSQL tests/CI, and added the migration runner.
 - `eee9873 fix: make amount migration atomic and observable` — made the migration SQL run in the runner-owned transaction, inserted the `schema_migrations` row in that same transaction, redacted the DSN in database errors, reported and checked row counts/totals, and applied the migration once to Render after approval.
 - `d3274a2 feat: preserve typed PayPal errors` — parses PayPal `name`, `message`, `details[].issue`, descriptions, and `debug_id` on non-2xx token/create/verify/capture/reconcile responses; empty/non-JSON responses retain the HTTP status and use `UNCLASSIFIED`. Tests cover structured errors and the empty 403 capture response.
+- `6c07a82 ci: require postgres tests and show verbose output` — PostgreSQL integration tests now fail with `CI=true` when their dedicated DB URL is missing, and the CI test command uses `-v` so test names appear in logs.
 - Sandbox evidence is in `docs/sandbox-findings.md`. Supported negative-test mock responses returned specific `details[].issue` values. `INSUFFICIENT_FUNDS` as a mock code returned HTTP 403 with an empty body and is not listed in PayPal's Orders v2 error reference.
 
 ## In progress / next step
 
 - Phase 1.0 migration was approved and applied once to the user's Render Postgres database on 2026-11-06. The runner now executes the migration and records `schema_migrations` in one transaction, redacts `DATABASE_URL` from errors, and checks/reports row counts and total minor units before and after.
 - Post-migration read verification: the locally started app on port 18080 returned HTTP 200 from `/api/transactions` with 10 rows and HTTP 200 plus valid JSON from `/api/spend-intelligence`. No capture endpoint was called. Port 8080 was already occupied, so the verification instance used `PORT=18080` and was stopped afterward.
-- Current local checks: `gofmt -l .` returned no files, `go vet ./...` exited 0, and `go test -race -count=1 ./...` passed with `ok paypal-ai-auditor 2.379s`; `cmd/migrate` compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
+- Current local checks: `gofmt -l .` returned no files, `go vet ./...` exited 0, and `go test -race -count=1 -v ./...` passed with `ok paypal-ai-auditor 2.331s`; `cmd/migrate` compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally; in CI, a missing URL is now fatal. The verbose output lists each test and its skip/pass status.
 - GitHub Actions run [Go CI #42202927196](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42202927196) for commit `eee987358dba10d84df0355b1fd961c7e2184763` completed successfully on 2026-11-06. Its PostgreSQL 16 service and dedicated `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` were configured for `go test -race -count=1 ./...`; all three PostgreSQL integration tests ran (they skip only when that variable is empty): `TestPostgresAdvisoryLockSerializesSameOrder`, `TestPostgresLegacyMinorFallback`, and `TestPostgresLockPersistenceFailureRetryReconciles`.
 - Phase 1.1 is implemented and passes local tests. Pause here for review; Phase 1.2, attempts, and webhooks are next. Phase 2 decline classification still requires checking PayPal documentation for buyer-recoverable semantics before final wording.
 
@@ -53,7 +54,7 @@ Tests and static checks:
 $goExe = 'C:\Program Files\Go\bin\go.exe'
 & $goExe version
 & $goExe vet ./...
-& $goExe test -race -count=1 ./...
+& $goExe test -race -count=1 -v ./...
 ```
 
 Start the app (requires `DATABASE_URL`, PayPal Sandbox credentials, and the correct database schema in `.env`):
