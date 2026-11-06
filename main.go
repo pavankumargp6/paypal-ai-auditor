@@ -35,6 +35,74 @@ const liveRecordsQuery = `SELECT id, ` + amountMinorFallbackExpression + ` AS am
 
 var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
 
+type PayPalErrorDetail struct {
+	Issue       string `json:"issue"`
+	Description string `json:"description"`
+}
+
+// PayPalAPIError preserves structured response fields without retaining or logging
+// the raw response body, which may contain data that should not be emitted.
+type PayPalAPIError struct {
+	HTTPStatus   int
+	Name         string
+	Message      string
+	Details      []PayPalErrorDetail
+	DebugID      string
+	ReasonCode   string
+	ReasonDetail string
+}
+
+func (e *PayPalAPIError) Error() string {
+	message := fmt.Sprintf("PayPal API returned HTTP %d (%s): %s", e.HTTPStatus, e.ReasonCode, e.ReasonDetail)
+	if e.DebugID != "" {
+		message += " (debug_id=" + e.DebugID + ")"
+	}
+	return message
+}
+
+func newPayPalAPIError(status int, body []byte) *PayPalAPIError {
+	var response struct {
+		Name        string              `json:"name"`
+		Message     string              `json:"message"`
+		Error       string              `json:"error"`
+		Description string              `json:"error_description"`
+		Details     []PayPalErrorDetail `json:"details"`
+		DebugID     string              `json:"debug_id"`
+	}
+	_ = json.Unmarshal(body, &response)
+	if response.Name == "" {
+		response.Name = response.Error
+	}
+	if response.Message == "" {
+		response.Message = response.Description
+	}
+	apiErr := &PayPalAPIError{
+		HTTPStatus: status,
+		Name:       response.Name,
+		Message:    response.Message,
+		Details:    response.Details,
+		DebugID:    response.DebugID,
+		ReasonCode: "UNCLASSIFIED",
+	}
+	for _, detail := range response.Details {
+		if detail.Issue != "" {
+			apiErr.ReasonCode = detail.Issue
+			apiErr.ReasonDetail = detail.Description
+			break
+		}
+	}
+	if apiErr.ReasonCode == "UNCLASSIFIED" && response.Name != "" {
+		apiErr.ReasonCode = response.Name
+	}
+	if apiErr.ReasonDetail == "" {
+		apiErr.ReasonDetail = response.Message
+	}
+	if apiErr.ReasonDetail == "" {
+		apiErr.ReasonDetail = fmt.Sprintf("HTTP %d response contained no parseable PayPal error details", status)
+	}
+	return apiErr
+}
+
 type captureTransactionContextKey struct{}
 
 const captureInsertSQL = `INSERT INTO captures (id, amount, amount_minor, status, currency, date, is_live)
@@ -490,7 +558,7 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 		return "", fmt.Errorf("read token body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("token request failed with status %d", resp.StatusCode)
+		return "", fmt.Errorf("token request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 
 	var result struct {
@@ -540,7 +608,7 @@ func createPayPalOrder(ctx context.Context, token, returnURL string) (string, st
 		return "", "", fmt.Errorf("read order body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("order request failed with status %d", resp.StatusCode)
+		return "", "", fmt.Errorf("order request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 
 	var result struct {
@@ -589,7 +657,7 @@ func verifyOrderStatus(ctx context.Context, token, orderID string) (string, erro
 		return "", fmt.Errorf("read verify body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("verify request failed with status %d", resp.StatusCode)
+		return "", fmt.Errorf("verify request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 
 	var result struct {
@@ -629,29 +697,13 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 		return PaymentRecord{}, fmt.Errorf("read capture body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if paypalResponseHasIssue(body, "ORDER_ALREADY_CAPTURED") {
-			return PaymentRecord{}, fmt.Errorf("%w (HTTP %d)", errOrderAlreadyCaptured, resp.StatusCode)
+		apiErr := newPayPalAPIError(resp.StatusCode, body)
+		if apiErr.ReasonCode == "ORDER_ALREADY_CAPTURED" {
+			return PaymentRecord{}, fmt.Errorf("%w: %w", errOrderAlreadyCaptured, apiErr)
 		}
-		return PaymentRecord{}, fmt.Errorf("capture request failed with status %d", resp.StatusCode)
+		return PaymentRecord{}, fmt.Errorf("capture request: %w", apiErr)
 	}
 	return parseCaptureFromBody(body)
-}
-
-func paypalResponseHasIssue(body []byte, issue string) bool {
-	var response struct {
-		Details []struct {
-			Issue string `json:"issue"`
-		} `json:"details"`
-	}
-	if err := json.Unmarshal(body, &response); err != nil {
-		return false
-	}
-	for _, detail := range response.Details {
-		if detail.Issue == issue {
-			return true
-		}
-	}
-	return false
 }
 
 func reconcileCapture(ctx context.Context, token, orderID string) (PaymentRecord, error) {
@@ -673,7 +725,7 @@ func reconcileCapture(ctx context.Context, token, orderID string) (PaymentRecord
 		return PaymentRecord{}, fmt.Errorf("read reconcile body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return PaymentRecord{}, fmt.Errorf("reconcile request failed with status %d", resp.StatusCode)
+		return PaymentRecord{}, fmt.Errorf("reconcile request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 	return parseCaptureFromBody(body)
 }

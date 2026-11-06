@@ -230,6 +230,40 @@ func TestGetPayPalToken_Non2xxStatus(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for non-2xx status")
 	}
+	var apiErr *PayPalAPIError
+	if !errors.As(err, &apiErr) || apiErr.ReasonCode != "invalid_client" {
+		t.Fatalf("error = %v, want typed PayPal invalid_client error", err)
+	}
+}
+
+func TestPayPalAPIErrorPreservesStructuredDetails(t *testing.T) {
+	err := newPayPalAPIError(http.StatusUnprocessableEntity, []byte(`{"name":"UNPROCESSABLE_ENTITY","message":"Request failed","debug_id":"DBG123","details":[{"issue":"INSTRUMENT_DECLINED","description":"Try another funding source"}]}`))
+	if err.Name != "UNPROCESSABLE_ENTITY" || err.Message != "Request failed" || err.DebugID != "DBG123" {
+		t.Fatalf("structured error fields not preserved: %+v", err)
+	}
+	if err.ReasonCode != "INSTRUMENT_DECLINED" || err.ReasonDetail != "Try another funding source" {
+		t.Fatalf("reason fields = %q/%q", err.ReasonCode, err.ReasonDetail)
+	}
+}
+
+func TestPayPalAPIErrorUnclassifiedFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "empty body"},
+		{name: "non-json body", body: []byte("upstream unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newPayPalAPIError(http.StatusForbidden, tc.body)
+			if err.HTTPStatus != http.StatusForbidden || err.ReasonCode != "UNCLASSIFIED" {
+				t.Fatalf("error = %+v, want HTTP 403 UNCLASSIFIED", err)
+			}
+			if !strings.Contains(err.Error(), "HTTP 403") {
+				t.Errorf("error string %q omits HTTP status", err.Error())
+			}
+		})
+	}
 }
 
 func TestGetPayPalToken_NetworkFailure(t *testing.T) {
@@ -356,6 +390,18 @@ func TestCapturePayPalOrder_Non2xxStatus(t *testing.T) {
 	_, err := capturePayPalOrder(context.Background(), "token", "ORDER1")
 	if err == nil {
 		t.Error("Expected error for 422 status")
+	}
+}
+
+func TestCapturePayPalOrder_Empty403IsTypedUnclassified(t *testing.T) {
+	mockResponse(t, http.StatusForbidden, "")
+	_, err := capturePayPalOrder(context.Background(), "token", "ORDER1")
+	var apiErr *PayPalAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want typed PayPal API error", err)
+	}
+	if apiErr.HTTPStatus != http.StatusForbidden || apiErr.ReasonCode != "UNCLASSIFIED" {
+		t.Fatalf("error = %+v, want HTTP 403 UNCLASSIFIED", apiErr)
 	}
 }
 
