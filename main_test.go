@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -177,6 +178,31 @@ func TestMoneyFieldsUseIntegerMinorUnits(t *testing.T) {
 				t.Errorf("money field %s.%s uses float64", typ.Name(), field.Name)
 			}
 		}
+	}
+}
+
+func TestDashboardUsesMinorUnitAPIFields(t *testing.T) {
+	contents, err := os.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(contents)
+	for _, fragment := range []string{
+		`field: "amount_minor"`,
+		`formatMinorCurrency(p.value, p.data.currency)`,
+		`formatMinorCurrency(intel.total_captured_minor, 'USD')`,
+		`BigInt(minor ?? "0")`,
+		`style: "currency", currency`,
+	} {
+		if !strings.Contains(html, fragment) {
+			t.Errorf("dashboard is missing minor-unit contract %q", fragment)
+		}
+	}
+	if got := formatMinorUnits(17500, "USD"); got != "175.00" {
+		t.Fatalf("dashboard revenue amount digits for 17500 minor units = %q, want 175.00 (Intl.NumberFormat supplies the USD symbol)", got)
+	}
+	if display := "$" + formatMinorUnits(17500, "USD"); display != "$175.00" {
+		t.Fatalf("dashboard revenue display = %q, want $175.00", display)
 	}
 }
 
