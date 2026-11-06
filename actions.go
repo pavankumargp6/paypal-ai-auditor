@@ -40,6 +40,15 @@ type findingResponse struct {
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
+func registerFindingRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/findings", makeFindingsHandler())
+	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler())
+	mux.HandleFunc("/api/findings/leakage-score", makeLeakageScoreHandler())
+	mux.HandleFunc("/api/findings/seed-demo", makeSeedDemoFindingHandler())
+	mux.HandleFunc("/api/findings/", makeFindingActionHandler())
+	mux.HandleFunc("/api/leakage-score", makeLeakageScoreHandler())
+}
+
 func makeDetectFindingsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -92,7 +101,8 @@ func makeFindingsHandler() http.HandlerFunc {
 
 func makeLeakageScoreHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.Header().Set("Allow", "GET, POST")
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
@@ -104,6 +114,56 @@ func makeLeakageScoreHandler() http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, score)
+	}
+}
+
+type seedDemoResponse struct {
+	Created bool            `json:"created"`
+	Finding findingResponse `json:"finding"`
+}
+
+func makeSeedDemoFindingHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+
+		const fingerprint = "synthetic-demo:duplicate_capture:v1"
+		const evidence = `{"is_synthetic":true,"label":"Synthetic Demo","demo_key":"duplicate_capture_v1","reason":"multiple_successful_captures_for_order","paypal_order_id":"DEMO-ORDER-DUPLICATE","capture_ids":["DEMO-CAPTURE-1","DEMO-CAPTURE-2"],"captures":[{"capture_id":"DEMO-CAPTURE-1","amount_minor":2500,"currency":"USD"},{"capture_id":"DEMO-CAPTURE-2","amount_minor":2500,"currency":"USD"}],"monetary_excess_known":true}`
+		const explanation = "Simulated duplicate-capture finding for the demo. The capture IDs and order are synthetic; no PayPal transaction was made."
+
+		var response seedDemoResponse
+		err := db.QueryRowContext(ctx, `INSERT INTO findings (fingerprint, detector, status, amount_minor, currency, evidence, explanation)
+			VALUES ($1, 'duplicate_capture', 'open', 2500, 'USD', $2::jsonb, $3)
+			ON CONFLICT (fingerprint) DO NOTHING
+			RETURNING id, detector, status, amount_minor, currency, evidence, explanation, created_at`,
+			fingerprint, evidence, explanation).Scan(&response.Finding.ID, &response.Finding.Detector, &response.Finding.Status,
+			&response.Finding.AmountMinor, &response.Finding.Currency, &response.Finding.Evidence,
+			&response.Finding.Explanation, &response.Finding.CreatedAt)
+		if err == nil {
+			response.Created = true
+		} else if errors.Is(err, sql.ErrNoRows) {
+			err = db.QueryRowContext(ctx, `SELECT id, detector, status, amount_minor, currency, evidence, explanation, created_at
+				FROM findings WHERE fingerprint = $1`, fingerprint).Scan(&response.Finding.ID, &response.Finding.Detector,
+				&response.Finding.Status, &response.Finding.AmountMinor, &response.Finding.Currency, &response.Finding.Evidence,
+				&response.Finding.Explanation, &response.Finding.CreatedAt)
+		} else {
+			sendJSONError(w, "Demo finding could not be seeded", http.StatusInternalServerError)
+			return
+		}
+		if err != nil {
+			sendJSONError(w, "Demo finding could not be loaded", http.StatusInternalServerError)
+			return
+		}
+		status := http.StatusOK
+		if response.Created {
+			status = http.StatusCreated
+		}
+		writeJSON(w, status, response)
 	}
 }
 

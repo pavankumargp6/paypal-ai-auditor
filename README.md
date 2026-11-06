@@ -32,14 +32,15 @@ Required variables:
 ## Findings and Actions
 - Deterministic Go detectors create `duplicate_capture` and `fee_mismatch` findings; Groq does not decide leak status or amounts. Groq is limited to plain-English insight/explanation text.
 - Duplicate-capture evidence includes the capture IDs. Fee evidence records expected fee, PayPal's reported `seller_receivable_breakdown.paypal_fee`, and the delta in minor units ([PayPal webhook payload](https://developer.paypal.com/api/rest/webhooks/rest/)). The fee detector applies the requested `round(amount_minor * 0.029) + 30` heuristic and flags differences greater than one minor unit; this is a heuristic, not PayPal's full merchant-specific fee schedule.
-- Leakage score SQL groups open findings as lost, open/acknowledged findings as recoverable, and actioned findings as recovered. Here, “recovered” follows the requested actioned status mapping; it is not proof that funds were returned.
+- `GET` or bodyless `POST /api/findings/leakage-score` (also available as `GET` or `POST /api/leakage-score`) returns live lost/recoverable/recovered totals plus separate `simulated_*_minor` totals. Open findings are lost, open/acknowledged findings are recoverable, and actioned findings are recovered; “recovered” is the requested actioned status mapping, not proof that funds were returned.
+- `POST /api/findings/seed-demo` idempotently creates a simulated $25 duplicate-capture finding with synthetic order/capture IDs. It appears only in simulated leakage-score buckets; use it to try the propose/approve flow. It does not call PayPal or move funds.
 - Approving an action records an executed status and audit events in JSONB; `money_moved` remains false. No action endpoint moves funds.
 
 ## Limitations
 - **Sandbox only:** Payments use PayPal Sandbox; do not use this app for live transactions.
 - **No authentication:** API endpoints do not authenticate users and must not be exposed as a production merchant system.
 - **Sandbox reason codes:** Reason codes come from sandbox negative testing and do not establish production decline behavior.
-- **Synthetic data:** Synthetic records are labeled in the UI and excluded from live metrics.
+- **Synthetic data:** Synthetic payment attempts and findings are labeled and excluded from live metrics. The leakage-score API reports demo findings in separate `simulated_*_minor` buckets.
 - **Decline definition:** Only `INSTRUMENT_DECLINED`, `PAYER_CANNOT_PAY`, and `PAYMENT_DENIED` count as declines. These reason codes come from sandbox negative testing. PayPal's [payment failure guide](https://developer.paypal.com/api/handle-payment-failures/) suggests trying a different payment method for these conditions. “Recoverable” means the buyer can retry with another funding source; it does not guarantee recovery.
 - **Webhook data:** Stored webhook payloads may contain payer data. This application is sandbox only; do not send production payer payloads to it.
 - **Decline Rate:** The rate counts only the three decline codes above in real (non-synthetic) capture attempts; reconciles and other failure codes are excluded. It is unavailable until capture attempts exist.

@@ -14,9 +14,12 @@ import (
 )
 
 const leakageScoreQuery = `SELECT
-	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'open'), 0) AS lost_minor,
-	COALESCE(SUM(amount_minor) FILTER (WHERE status IN ('open', 'acknowledged')), 0) AS recoverable_minor,
-	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'actioned'), 0) AS recovered_minor
+	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'open' AND evidence->>'is_synthetic' IS DISTINCT FROM 'true'), 0) AS lost_minor,
+	COALESCE(SUM(amount_minor) FILTER (WHERE status IN ('open', 'acknowledged') AND evidence->>'is_synthetic' IS DISTINCT FROM 'true'), 0) AS recoverable_minor,
+	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'actioned' AND evidence->>'is_synthetic' IS DISTINCT FROM 'true'), 0) AS recovered_minor,
+	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'open' AND evidence->>'is_synthetic' = 'true'), 0) AS simulated_lost_minor,
+	COALESCE(SUM(amount_minor) FILTER (WHERE status IN ('open', 'acknowledged') AND evidence->>'is_synthetic' = 'true'), 0) AS simulated_recoverable_minor,
+	COALESCE(SUM(amount_minor) FILTER (WHERE status = 'actioned' AND evidence->>'is_synthetic' = 'true'), 0) AS simulated_recovered_minor
 FROM findings`
 
 type findingDraft struct {
@@ -279,9 +282,12 @@ func validFindingCurrency(currency string) string {
 }
 
 type leakageScore struct {
-	LostMinor        int64 `json:"lost_minor,string"`
-	RecoverableMinor int64 `json:"recoverable_minor,string"`
-	RecoveredMinor   int64 `json:"recovered_minor,string"`
+	LostMinor                 int64 `json:"lost_minor,string"`
+	RecoverableMinor          int64 `json:"recoverable_minor,string"`
+	RecoveredMinor            int64 `json:"recovered_minor,string"`
+	SimulatedLostMinor        int64 `json:"simulated_lost_minor,string"`
+	SimulatedRecoverableMinor int64 `json:"simulated_recoverable_minor,string"`
+	SimulatedRecoveredMinor   int64 `json:"simulated_recovered_minor,string"`
 }
 
 func loadLeakageScore(ctx context.Context, targetDB *sql.DB) (leakageScore, error) {
@@ -289,6 +295,7 @@ func loadLeakageScore(ctx context.Context, targetDB *sql.DB) (leakageScore, erro
 	if targetDB == nil {
 		return score, errors.New("database unavailable")
 	}
-	err := targetDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&score.LostMinor, &score.RecoverableMinor, &score.RecoveredMinor)
+	err := targetDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&score.LostMinor, &score.RecoverableMinor, &score.RecoveredMinor,
+		&score.SimulatedLostMinor, &score.SimulatedRecoverableMinor, &score.SimulatedRecoveredMinor)
 	return score, err
 }

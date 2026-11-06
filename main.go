@@ -360,11 +360,8 @@ func main() {
 	mux.HandleFunc("/api/capture-order", makeCaptureOrderHandler(clientID, clientSecret))
 	mux.HandleFunc("/api/spend-intelligence", makeSpendHandler(groqKey))
 	mux.HandleFunc("/api/transactions", makeTransactionsHandler())
-	mux.HandleFunc("/api/findings", makeFindingsHandler())
-	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler())
-	mux.HandleFunc("/api/findings/", makeFindingActionHandler())
+	registerFindingRoutes(mux)
 	mux.HandleFunc("/api/actions/", makeApproveActionHandler())
-	mux.HandleFunc("/api/leakage-score", makeLeakageScoreHandler())
 	webhookID := strings.TrimSpace(os.Getenv("PAYPAL_WEBHOOK_ID"))
 	mux.HandleFunc("/webhooks/paypal", makePayPalWebhookHandler(clientID, clientSecret, webhookID))
 

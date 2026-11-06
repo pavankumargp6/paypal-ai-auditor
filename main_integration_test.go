@@ -372,7 +372,8 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 		}
 	}
 	var baseline leakageScore
-	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&baseline.LostMinor, &baseline.RecoverableMinor, &baseline.RecoveredMinor); err != nil {
+	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&baseline.LostMinor, &baseline.RecoverableMinor, &baseline.RecoveredMinor,
+		&baseline.SimulatedLostMinor, &baseline.SimulatedRecoverableMinor, &baseline.SimulatedRecoveredMinor); err != nil {
 		t.Fatalf("read baseline leakage score: %v", err)
 	}
 	var findingID int64
@@ -429,11 +430,110 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 		t.Fatalf("finding status=%q, want actioned", findingStatus)
 	}
 	var after leakageScore
-	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&after.LostMinor, &after.RecoverableMinor, &after.RecoveredMinor); err != nil {
+	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&after.LostMinor, &after.RecoverableMinor, &after.RecoveredMinor,
+		&after.SimulatedLostMinor, &after.SimulatedRecoverableMinor, &after.SimulatedRecoveredMinor); err != nil {
 		t.Fatalf("read final leakage score: %v", err)
 	}
 	if after.LostMinor != baseline.LostMinor || after.RecoverableMinor != baseline.RecoverableMinor || after.RecoveredMinor != baseline.RecoveredMinor+200 {
 		t.Fatalf("leakage score before=%+v after=%+v; expected 200 minor units to move from open to actioned", baseline, after)
+	}
+}
+
+func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	const demoFingerprint = "synthetic-demo:duplicate_capture:v1"
+	if _, err := testDB.Exec(`DELETE FROM actions WHERE finding_id IN (SELECT id FROM findings WHERE fingerprint = $1)`, demoFingerprint); err != nil {
+		t.Fatalf("clear prior demo actions in integration DB: %v", err)
+	}
+	if _, err := testDB.Exec(`DELETE FROM findings WHERE fingerprint = $1`, demoFingerprint); err != nil {
+		t.Fatalf("clear prior demo finding in integration DB: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testDB.Exec(`DELETE FROM actions WHERE finding_id IN (SELECT id FROM findings WHERE fingerprint = $1)`, demoFingerprint)
+		_, _ = testDB.Exec(`DELETE FROM findings WHERE fingerprint = $1`, demoFingerprint)
+	})
+
+	mux := http.NewServeMux()
+	registerFindingRoutes(mux)
+	mux.HandleFunc("/api/actions/", makeApproveActionHandler())
+
+	requestScore := func(method string) leakageScore {
+		t.Helper()
+		request := httptest.NewRequest(method, "/api/findings/leakage-score", nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s leakage score response=%d %s, want 200", method, response.Code, response.Body.String())
+		}
+		var score leakageScore
+		if err := json.Unmarshal(response.Body.Bytes(), &score); err != nil {
+			t.Fatalf("decode %s leakage score: %v", method, err)
+		}
+		return score
+	}
+	baseline := requestScore(http.MethodGet)
+	if postScore := requestScore(http.MethodPost); postScore != baseline {
+		t.Fatalf("empty-body POST score=%+v, GET score=%+v", postScore, baseline)
+	}
+
+	seedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
+	seedResponse := httptest.NewRecorder()
+	mux.ServeHTTP(seedResponse, seedRequest)
+	if seedResponse.Code != http.StatusCreated {
+		t.Fatalf("seed-demo response=%d %s, want 201", seedResponse.Code, seedResponse.Body.String())
+	}
+	var seeded seedDemoResponse
+	if err := json.Unmarshal(seedResponse.Body.Bytes(), &seeded); err != nil {
+		t.Fatalf("decode seed-demo response: %v", err)
+	}
+	var evidence struct {
+		IsSynthetic bool     `json:"is_synthetic"`
+		Label       string   `json:"label"`
+		CaptureIDs  []string `json:"capture_ids"`
+	}
+	if err := json.Unmarshal(seeded.Finding.Evidence, &evidence); err != nil {
+		t.Fatalf("decode seeded evidence: %v", err)
+	}
+	if !seeded.Created || seeded.Finding.Detector != "duplicate_capture" || seeded.Finding.Status != "open" ||
+		seeded.Finding.AmountMinor != 2500 || !evidence.IsSynthetic || evidence.Label != "Synthetic Demo" || len(evidence.CaptureIDs) != 2 {
+		t.Fatalf("seeded demo finding = %+v evidence=%+v", seeded, evidence)
+	}
+
+	secondSeedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
+	secondSeedResponse := httptest.NewRecorder()
+	mux.ServeHTTP(secondSeedResponse, secondSeedRequest)
+	var secondSeed seedDemoResponse
+	if secondSeedResponse.Code != http.StatusOK || json.Unmarshal(secondSeedResponse.Body.Bytes(), &secondSeed) != nil ||
+		secondSeed.Created || secondSeed.Finding.ID != seeded.Finding.ID {
+		t.Fatalf("idempotent seed response=%d body=%s decoded=%+v", secondSeedResponse.Code, secondSeedResponse.Body.String(), secondSeed)
+	}
+	seededScore := requestScore(http.MethodPost)
+	if seededScore.LostMinor != baseline.LostMinor || seededScore.RecoverableMinor != baseline.RecoverableMinor ||
+		seededScore.SimulatedLostMinor != baseline.SimulatedLostMinor+2500 ||
+		seededScore.SimulatedRecoverableMinor != baseline.SimulatedRecoverableMinor+2500 {
+		t.Fatalf("score after seed=%+v baseline=%+v; expected one simulated $25 finding without changing live totals", seededScore, baseline)
+	}
+
+	proposalRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/findings/%d/action", seeded.Finding.ID), strings.NewReader(`{"action_type":"record_recovery","description":"Demo action only"}`))
+	proposalResponse := httptest.NewRecorder()
+	mux.ServeHTTP(proposalResponse, proposalRequest)
+	var proposal actionResponse
+	if proposalResponse.Code != http.StatusCreated || json.Unmarshal(proposalResponse.Body.Bytes(), &proposal) != nil {
+		t.Fatalf("demo action proposal response=%d %s", proposalResponse.Code, proposalResponse.Body.String())
+	}
+	approveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", proposal.ID), nil)
+	approveResponse := httptest.NewRecorder()
+	mux.ServeHTTP(approveResponse, approveRequest)
+	if approveResponse.Code != http.StatusOK {
+		t.Fatalf("demo action approval response=%d %s", approveResponse.Code, approveResponse.Body.String())
+	}
+	afterApproval := requestScore(http.MethodGet)
+	if afterApproval.LostMinor != baseline.LostMinor || afterApproval.RecoverableMinor != baseline.RecoverableMinor ||
+		afterApproval.RecoveredMinor != baseline.RecoveredMinor ||
+		afterApproval.SimulatedLostMinor != baseline.SimulatedLostMinor ||
+		afterApproval.SimulatedRecoverableMinor != baseline.SimulatedRecoverableMinor ||
+		afterApproval.SimulatedRecoveredMinor != baseline.SimulatedRecoveredMinor+2500 {
+		t.Fatalf("score after demo approval=%+v baseline=%+v", afterApproval, baseline)
 	}
 }
 

@@ -812,6 +812,10 @@ func TestLeakageScoreQueryUsesRequiredStatuses(t *testing.T) {
 		"status IN ('open', 'acknowledged')",
 		"status = 'actioned'",
 		"SUM(amount_minor)",
+		"evidence->>'is_synthetic' IS DISTINCT FROM 'true'",
+		"simulated_lost_minor",
+		"simulated_recoverable_minor",
+		"simulated_recovered_minor",
 	} {
 		if !strings.Contains(leakageScoreQuery, fragment) {
 			t.Errorf("leakage score query missing %q", fragment)
