@@ -258,8 +258,6 @@ func makeApproveActionHandler() http.HandlerFunc {
 					jsonb_build_object('status', 'approved', 'at', NOW(), 'money_moved', FALSE),
 					jsonb_build_object('status', 'executed', 'at', NOW(), 'money_moved', FALSE)), TRUE)
 			WHERE id = $1 AND status = 'proposed'
-				AND result->>'money_moved' = 'false'
-				AND result->>'execution_mode' = 'record_only'
 			RETURNING id, finding_id, action_type, status, result`, actionID).
 			Scan(&response.ID, &response.FindingID, &actionType, &response.Status, &response.Result)
 		if err != nil {
