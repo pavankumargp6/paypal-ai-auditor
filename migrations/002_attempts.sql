@@ -1,5 +1,5 @@
 -- Additive attempts history for PayPal create, approval, capture, and reconcile outcomes.
--- Decline rate uses real capture rows and excludes reconciled / ORDER_ALREADY_CAPTURED outcomes.
+-- Decline rate denominator is real capture outcomes (succeeded, declined, failed); it excludes synthetic rows, reconciles, and ORDER_ALREADY_CAPTURED.
 -- CI runs both additive migrations against a disposable PostgreSQL service database.
 CREATE TABLE IF NOT EXISTS attempts (
     id BIGSERIAL PRIMARY KEY,
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     currency TEXT NOT NULL,
     is_synthetic BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT attempts_stage_check CHECK (stage IN ('create', 'approve', 'capture', 'reconcile')),
+    CONSTRAINT attempts_stage_check CHECK (stage IN ('create', 'approve', 'capture', 'reconcile', 'webhook')),
     CONSTRAINT attempts_outcome_check CHECK (outcome IN ('succeeded', 'failed', 'declined', 'reconciled')),
     CONSTRAINT attempts_http_status_check CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
     CONSTRAINT attempts_amount_minor_check CHECK (amount_minor >= 0),

@@ -631,7 +631,7 @@ func TestAttemptsMigrationIsAdditiveAndHasRequiredColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlText := strings.ToLower(string(contents))
-	for _, column := range []string{"paypal_order_id text", "capture_id text", "debug_id text", "stage text not null", "outcome text not null", "reason_code text,", "reason_detail text,", "http_status integer", "amount_minor bigint not null", "currency text not null", "is_synthetic boolean not null", "created_at timestamptz not null", "attempts_stage_check", "attempts_outcome_check", "attempts_http_status_check", "attempts_paypal_order_created_at_idx"} {
+	for _, column := range []string{"paypal_order_id text", "capture_id text", "debug_id text", "stage text not null", "outcome text not null", "reason_code text,", "reason_detail text,", "http_status integer", "amount_minor bigint not null", "currency text not null", "is_synthetic boolean not null", "created_at timestamptz not null", "attempts_stage_check", "stage in ('create', 'approve', 'capture', 'reconcile', 'webhook')", "attempts_outcome_check", "attempts_http_status_check", "attempts_paypal_order_created_at_idx"} {
 		if !strings.Contains(sqlText, column) {
 			t.Errorf("migration 002 missing required column declaration %q", column)
 		}
