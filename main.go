@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -183,18 +182,19 @@ type PaymentRecord struct {
 }
 
 type insightCacheEntry struct {
-	insight   string
+	result    InsightResult
 	expiresAt time.Time
 	ready     chan struct{}
 }
 
 type SpendSummary struct {
-	TotalCapturedMinor   int64   `json:"total_captured_minor,string"`
-	LiveSuccess          int     `json:"live_success"`
-	DemoCompletedCount   int     `json:"demo_completed_count"`
-	DeclineRateAvailable bool    `json:"decline_rate_available"`
-	DeclineRatePercent   float64 `json:"decline_rate_percent"`
-	AIInsight            string  `json:"ai_insight"`
+	TotalCapturedMinor   int64             `json:"total_captured_minor,string"`
+	LiveSuccess          int               `json:"live_success"`
+	DemoCompletedCount   int               `json:"demo_completed_count"`
+	DeclineRateAvailable bool              `json:"decline_rate_available"`
+	DeclineRatePercent   float64           `json:"decline_rate_percent"`
+	AIInsight            string            `json:"ai_insight"`
+	AIInsightCitations   []InsightCitation `json:"ai_insight_citations"`
 }
 
 func currencyExponent(currency string) int {
@@ -612,7 +612,15 @@ func makeSpendHandler(groqKey string) http.HandlerFunc {
 
 		summary := calculateSummary(liveRecords, getDemoRecords())
 		loadDeclineRate(ctx, &summary)
-		summary.AIInsight = cachedAIInsight(ctx, groqKey, summary)
+		evidence, evidenceErr := getInsightEvidence(ctx, liveRecords)
+		if evidenceErr != nil {
+			log.Printf("spend-intelligence evidence query failed")
+			summary.AIInsight = "AI insight unavailable."
+		} else {
+			insight := cachedAIInsight(ctx, groqKey, evidence)
+			summary.AIInsight = insight.Insight
+			summary.AIInsightCitations = insight.Citations
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(summary)
@@ -628,78 +636,6 @@ func loadDeclineRate(ctx context.Context, summary *SpendSummary) {
 		return
 	}
 	summary.DeclineRatePercent, summary.DeclineRateAvailable = declineRate(declined, total)
-}
-
-func cachedAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	key, err := insightSummaryKey(summary)
-	if err != nil {
-		return generateAIInsight(ctx, apiKey, summary)
-	}
-
-	for {
-		insightCache.Lock()
-		now := time.Now()
-		entry, exists := insightCache.entries[key]
-		if exists && entry.ready != nil {
-			ready := entry.ready
-			insightCache.Unlock()
-			select {
-			case <-ready:
-				continue
-			case <-ctx.Done():
-				return "AI insight unavailable."
-			}
-		}
-		if exists && now.Before(entry.expiresAt) {
-			value := entry.insight
-			insightCache.Unlock()
-			return value
-		}
-		entry = &insightCacheEntry{ready: make(chan struct{})}
-		insightCache.entries[key] = entry
-		insightCache.Unlock()
-
-		insight := generateAIInsight(ctx, apiKey, summary)
-		insightCache.Lock()
-		entry.insight = insight
-		entry.expiresAt = time.Now().Add(60 * time.Second)
-		close(entry.ready)
-		entry.ready = nil
-		pruneInsightCache(time.Now(), key)
-		insightCache.Unlock()
-		return insight
-	}
-}
-
-func insightSummaryKey(summary SpendSummary) ([32]byte, error) {
-	keySummary := summary
-	keySummary.AIInsight = ""
-	encoded, err := json.Marshal(keySummary)
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return sha256.Sum256(encoded), nil
-}
-
-func pruneInsightCache(now time.Time, keepKey [32]byte) {
-	for cachedKey, cached := range insightCache.entries {
-		if cached.ready == nil && now.After(cached.expiresAt) {
-			delete(insightCache.entries, cachedKey)
-		}
-	}
-	if len(insightCache.entries) <= 128 {
-		return
-	}
-	var oldestKey [32]byte
-	var oldest time.Time
-	for cachedKey, cached := range insightCache.entries {
-		if cached.ready == nil && cachedKey != keepKey && (oldest.IsZero() || cached.expiresAt.Before(oldest)) {
-			oldestKey, oldest = cachedKey, cached.expiresAt
-		}
-	}
-	if !oldest.IsZero() {
-		delete(insightCache.entries, oldestKey)
-	}
 }
 
 func makeTransactionsHandler() http.HandlerFunc {
@@ -1112,72 +1048,6 @@ func declineRate(declined, total int64) (float64, bool) {
 		return 0, false
 	}
 	return float64(declined) * 100 / float64(total), true
-}
-
-func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	declineRateText := "no data yet"
-	if summary.DeclineRateAvailable {
-		declineRateText = fmt.Sprintf("%.1f%%", summary.DeclineRatePercent)
-	}
-	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%s (%d payments), Demo %d. Decline rate %s. Give 1-sentence actionable insight. Max 20 words.`, formatMinorUnits(summary.TotalCapturedMinor, expectedCurrency), summary.LiveSuccess, summary.DemoCompletedCount, declineRateText)
-
-	payload := map[string]interface{}{
-		"model":       "openai/gpt-oss-20b",
-		"messages":    []map[string]string{{"role": "user", "content": prompt}},
-		"temperature": 0.1,
-	}
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return "AI insight unavailable."
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(jsonPayload))
-	if err != nil {
-		return "AI insight unavailable."
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("Groq insight request failed http_status=unavailable error_code=NETWORK_ERROR")
-		return "AI insight unavailable."
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		log.Printf("Groq insight request failed http_status=%d error_code=BODY_READ_ERROR", resp.StatusCode)
-		return "AI insight unavailable."
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("Groq insight request failed http_status=%d error_code=%s", resp.StatusCode, groqErrorCode(body))
-		return "AI insight unavailable."
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("Groq insight request failed http_status=%d error_code=INVALID_RESPONSE", resp.StatusCode)
-		return "AI insight unavailable."
-	}
-	if len(result.Choices) == 0 {
-		log.Printf("Groq insight request failed http_status=%d error_code=EMPTY_CHOICES", resp.StatusCode)
-		return "AI insight unavailable."
-	}
-
-	insight := strings.TrimSpace(result.Choices[0].Message.Content)
-	if insight == "" {
-		log.Printf("Groq insight request failed http_status=%d error_code=EMPTY_CONTENT", resp.StatusCode)
-		return "AI insight unavailable."
-	}
-	return insight
 }
 
 func groqErrorCode(body []byte) string {

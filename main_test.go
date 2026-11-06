@@ -202,6 +202,7 @@ func TestDashboardUsesMinorUnitAPIFields(t *testing.T) {
 		`valueGetter: p => p.data.is_live === true ? "PayPal Sandbox (Live)" : "Synthetic Demo"`,
 		`id="decline-rate"`,
 		`intel.decline_rate_percent`,
+		`intel.ai_insight_citations`,
 		`"No data yet"`,
 	} {
 		if !strings.Contains(html, fragment) {
@@ -537,7 +538,35 @@ func TestParseCaptureUsesPayPalTimestamps(t *testing.T) {
 	}
 }
 
-func TestCachedAIInsightIsKeyedAndExpiresAfterOneMinute(t *testing.T) {
+func testInsightEvidence() InsightEvidence {
+	return InsightEvidence{
+		CapturedTotalMinor: 2500,
+		CaptureCount:       1,
+		Captures: []InsightCapture{{
+			OrderID: "ORDER-1", CaptureID: "CAP-1", AmountMinor: 2500, Currency: "USD", Date: "2026-11-06T12:00:00Z",
+		}},
+	}
+}
+
+func TestBuildInsightEvidenceExcludesSyntheticAndUnmatchedRows(t *testing.T) {
+	records := []PaymentRecord{
+		{ID: "CAP-REAL", AmountMinor: 2500, Status: "COMPLETED", Currency: "USD", IsLive: true},
+		{ID: "DEMO-CAP-101", AmountMinor: 99900, Status: "COMPLETED", Currency: "USD", IsLive: false},
+		{ID: "CAP-PENDING", AmountMinor: 1000, Status: "PENDING", Currency: "USD", IsLive: true},
+		{ID: "CAP-UNMATCHED", AmountMinor: 500, Status: "COMPLETED", Currency: "USD", IsLive: true},
+	}
+	got := buildInsightEvidence(records, map[string]string{
+		"CAP-REAL": "ORDER-REAL", "DEMO-CAP-101": "ORDER-DEMO", "CAP-PENDING": "ORDER-PENDING",
+	})
+	if got.CaptureCount != 1 || got.CapturedTotalMinor != 2500 || len(got.Captures) != 1 {
+		t.Fatalf("evidence = %+v, want one real completed capture", got)
+	}
+	if got.Captures[0].OrderID != "ORDER-REAL" || got.Captures[0].CaptureID != "CAP-REAL" {
+		t.Fatalf("evidence citation = %+v, want real order/capture IDs", got.Captures[0])
+	}
+}
+
+func TestCachedAIInsightUsesEvidenceHashStrictSchemaAndZeroTemperature(t *testing.T) {
 	insightCache.Lock()
 	insightCache.entries = make(map[[32]byte]*insightCacheEntry)
 	insightCache.Unlock()
@@ -548,24 +577,60 @@ func TestCachedAIInsightIsKeyedAndExpiresAfterOneMinute(t *testing.T) {
 	})
 	saveTransport(t)
 	calls := 0
-	httpClient.Transport = mockRoundTripper(func(*http.Request) (*http.Response, error) {
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
 		calls++
-		return resp(http.StatusOK, `{"choices":[{"message":{"content":"Cached insight"}}]}`), nil
+		var payload struct {
+			Model       string  `json:"model"`
+			Temperature float64 `json:"temperature"`
+			Messages    []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+			ResponseFormat json.RawMessage `json:"response_format"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Errorf("decode Groq request: %v", err)
+		} else {
+			if payload.Model != "openai/gpt-oss-20b" || payload.Temperature != 0 {
+				t.Errorf("model/temperature = %q/%v, want model and temperature 0", payload.Model, payload.Temperature)
+			}
+			if len(payload.Messages) != 2 || strings.Contains(payload.Messages[1].Content, "DEMO-CAP") || !strings.Contains(payload.Messages[1].Content, "CAP-1") {
+				t.Errorf("Groq user evidence included unexpected data: %+v", payload.Messages)
+			}
+			var format map[string]any
+			if err := json.Unmarshal(payload.ResponseFormat, &format); err != nil {
+				t.Errorf("decode response_format: %v", err)
+			} else {
+				jsonSchema, _ := format["json_schema"].(map[string]any)
+				if format["type"] != "json_schema" || jsonSchema["strict"] != true {
+					t.Errorf("response format = %s, want strict json_schema", payload.ResponseFormat)
+				}
+				schema, _ := jsonSchema["schema"].(map[string]any)
+				if schema["additionalProperties"] != false {
+					t.Errorf("top-level schema must reject extra properties: %s", payload.ResponseFormat)
+				}
+				properties, _ := schema["properties"].(map[string]any)
+				citations, _ := properties["citations"].(map[string]any)
+				items, _ := citations["items"].(map[string]any)
+				if items["additionalProperties"] != false {
+					t.Errorf("citation schema must reject extra properties: %s", payload.ResponseFormat)
+				}
+			}
+		}
+		return resp(http.StatusOK, `{"choices":[{"message":{"content":"{\"insight\":\"Recent captures are consistent.\",\"citations\":[{\"order_id\":\"ORDER-1\",\"capture_id\":\"CAP-1\"}]}"}}]}`), nil
 	})
 
 	ctx := context.Background()
-	summary := SpendSummary{TotalCapturedMinor: 17500, LiveSuccess: 7}
-	if got := cachedAIInsight(ctx, "test-key", summary); got != "Cached insight" {
-		t.Fatalf("first insight = %q", got)
-	}
-	if got := cachedAIInsight(ctx, "test-key", summary); got != "Cached insight" {
-		t.Fatalf("cached insight = %q", got)
+	evidence := testInsightEvidence()
+	first := cachedAIInsight(ctx, "test-key", evidence)
+	second := cachedAIInsight(ctx, "test-key", evidence)
+	if first.Insight != "Recent captures are consistent." || second.Insight != first.Insight || len(first.Citations) != 1 {
+		t.Fatalf("first/second structured insight = %+v / %+v", first, second)
 	}
 	if calls != 1 {
-		t.Fatalf("Groq calls for identical summary = %d, want 1", calls)
+		t.Fatalf("Groq calls for equal evidence = %d, want 1", calls)
 	}
-
-	key, err := insightSummaryKey(summary)
+	key, err := insightEvidenceHash(evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,17 +640,54 @@ func TestCachedAIInsightIsKeyedAndExpiresAfterOneMinute(t *testing.T) {
 	if entry == nil || !entry.expiresAt.After(time.Now()) || entry.expiresAt.After(time.Now().Add(time.Minute)) {
 		t.Fatalf("cache entry expiry = %+v, want an expiry within 60 seconds", entry)
 	}
-
-	changedSummary := summary
-	changedSummary.LiveSuccess++
-	if got := cachedAIInsight(ctx, "test-key", changedSummary); got != "Cached insight" {
-		t.Fatalf("changed-summary insight = %q", got)
-	}
+	changed := testInsightEvidence()
+	changed.Captures[0].AmountMinor++
+	changed.CapturedTotalMinor++
+	_ = cachedAIInsight(ctx, "test-key", changed)
 	if calls != 2 {
-		t.Fatalf("Groq calls after summary changed = %d, want 2", calls)
+		t.Fatalf("Groq calls after evidence changed = %d, want 2", calls)
 	}
 }
 
+func TestNoRealInsightEvidenceReturnsNotEnoughDataWithoutGroq(t *testing.T) {
+	saveTransport(t)
+	calls := 0
+	httpClient.Transport = mockRoundTripper(func(*http.Request) (*http.Response, error) {
+		calls++
+		return resp(http.StatusInternalServerError, `{}`), nil
+	})
+	got := cachedAIInsight(context.Background(), "test-key", InsightEvidence{})
+	if got.Insight != "Not enough data yet" || len(got.Citations) != 0 || calls != 0 {
+		t.Fatalf("empty evidence result=%+v Groq calls=%d, want no-data result and no request", got, calls)
+	}
+}
+
+func TestInsightOutputRejectsMalformedAndUnknownCitations(t *testing.T) {
+	evidence := testInsightEvidence()
+	tests := []struct{ name, content string }{
+		{name: "malformed JSON", content: `{not-json`},
+		{name: "unknown field", content: `{"insight":"ok","citations":[{"order_id":"ORDER-1","capture_id":"CAP-1"}],"extra":true}`},
+		{name: "trailing data", content: `{"insight":"ok","citations":[{"order_id":"ORDER-1","capture_id":"CAP-1"}]} {}`},
+		{name: "empty citations", content: `{"insight":"ok","citations":[]}`},
+		{name: "unknown IDs", content: `{"insight":"ok","citations":[{"order_id":"ORDER-OTHER","capture_id":"CAP-OTHER"}]}`},
+		{name: "mismatched pair", content: `{"insight":"ok","citations":[{"order_id":"ORDER-1","capture_id":"CAP-OTHER"}]}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := validateInsightOutput(tc.content, evidence); err == nil {
+				t.Fatal("validateInsightOutput accepted invalid output")
+			}
+		})
+	}
+}
+
+func TestGenerateAIInsightRejectsCitationNotInEvidence(t *testing.T) {
+	mockResponse(t, http.StatusOK, `{"choices":[{"message":{"content":"{\"insight\":\"A claim\",\"citations\":[{\"order_id\":\"ORDER-UNKNOWN\",\"capture_id\":\"CAP-UNKNOWN\"}]}"}}]}`)
+	got := generateAIInsight(context.Background(), "test-key", testInsightEvidence())
+	if got.Insight != "AI insight unavailable." || len(got.Citations) != 0 {
+		t.Fatalf("unknown-citation result = %+v, want unavailable", got)
+	}
+}
 func TestAttemptOutcomesPreservePayPalDeclineReasons(t *testing.T) {
 	tests := []struct {
 		issue   string
@@ -682,8 +784,8 @@ func TestGroqFailureLogsOnlyStatusAndErrorCode(t *testing.T) {
 	var output bytes.Buffer
 	log.SetOutput(&output)
 	t.Cleanup(func() { log.SetOutput(previousOutput) })
-	if got := generateAIInsight(context.Background(), "never-log-this-key", SpendSummary{}); got != "AI insight unavailable." {
-		t.Fatalf("generateAIInsight() = %q", got)
+	if got := generateAIInsight(context.Background(), "never-log-this-key", testInsightEvidence()); got.Insight != "AI insight unavailable." {
+		t.Fatalf("generateAIInsight() = %+v", got)
 	}
 	logged := output.String()
 	if !strings.Contains(logged, "http_status=401 error_code=invalid_api_key") {

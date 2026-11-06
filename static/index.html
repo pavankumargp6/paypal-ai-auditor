@@ -27,7 +27,10 @@
 <body>
     <div class="header">
         <h1>💳 PayPal Spend Intelligence Agent</h1>
-        <div class="badge" id="ai-insight" style="background:#e0f2fe; color:#0369a1; padding:10px 20px; border-radius:20px; font-weight:600;">Loading AI Insights...</div>
+        <div style="text-align:right">
+            <div class="badge" id="ai-insight" style="background:#e0f2fe; color:#0369a1; padding:10px 20px; border-radius:20px; font-weight:600;">Loading AI Insights...</div>
+            <div id="ai-insight-citations" style="margin-top:6px; color:#64748b; font-size:0.75rem;"></div>
+        </div>
     </div>
 
     <div class="summary-grid">
@@ -169,6 +172,8 @@
                 if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
                 const intel = await intelRes.json();
                 document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
+                document.getElementById('ai-insight-citations').innerText = (intel.ai_insight_citations || [])
+                    .map(c => `Order ${c.order_id} · Capture ${c.capture_id}`).join(" | ");
                 document.getElementById('total-revenue').innerText = formatMinorCurrency(intel.total_captured_minor, 'USD');
                 document.getElementById('total-success').innerText = intel.live_success || 0;
                 document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;

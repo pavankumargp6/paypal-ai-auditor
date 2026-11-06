@@ -190,3 +190,45 @@ func TestPostgresWebhookReceiptDeduplicates(t *testing.T) {
 	}
 	_, _ = testDB.ExecContext(ctx, `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
 }
+
+func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	captureID := fmt.Sprintf("INSGHT%d", time.Now().UnixNano())
+	orderID := fmt.Sprintf("ORDR%d", time.Now().UnixNano())
+	date := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := testDB.ExecContext(ctx, `INSERT INTO captures (id, amount, amount_minor, status, currency, date, is_live)
+		VALUES ($1, 25.00, 2500, 'COMPLETED', 'USD', $2, TRUE)`, captureID, date)
+	if err != nil {
+		t.Fatalf("insert live capture fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM attempts WHERE capture_id = $1`, captureID)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM captures WHERE id = $1`, captureID)
+	})
+	_, err = testDB.ExecContext(ctx, `INSERT INTO attempts
+		(paypal_order_id, capture_id, stage, outcome, amount_minor, currency, is_synthetic)
+		VALUES ($1, $2, 'capture', 'succeeded', 2500, 'USD', TRUE)`, orderID, captureID)
+	if err != nil {
+		t.Fatalf("insert synthetic attempt fixture: %v", err)
+	}
+	records := []PaymentRecord{{ID: captureID, AmountMinor: 2500, Status: "COMPLETED", Currency: "USD", Date: date, IsLive: true}}
+	evidence, err := getInsightEvidence(ctx, records)
+	if err != nil {
+		t.Fatalf("load evidence for synthetic attempt: %v", err)
+	}
+	if evidence.CaptureCount != 0 {
+		t.Fatalf("synthetic attempt entered LLM evidence: %+v", evidence)
+	}
+	if _, err := testDB.ExecContext(ctx, `UPDATE attempts SET is_synthetic = FALSE WHERE capture_id = $1`, captureID); err != nil {
+		t.Fatalf("mark fixture attempt real: %v", err)
+	}
+	evidence, err = getInsightEvidence(ctx, records)
+	if err != nil {
+		t.Fatalf("load evidence for real attempt: %v", err)
+	}
+	if evidence.CaptureCount != 1 || evidence.Captures[0].OrderID != orderID || evidence.Captures[0].CaptureID != captureID {
+		t.Fatalf("real attempt evidence = %+v, want fixture order/capture", evidence)
+	}
+}
