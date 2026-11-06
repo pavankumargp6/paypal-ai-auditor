@@ -26,7 +26,20 @@ const (
 	expectedCurrency          = "USD"
 )
 
+const amountMinorFallbackExpression = `COALESCE(amount_minor, ROUND(amount::numeric * CASE
+	WHEN UPPER(currency) IN ('JPY', 'HUF', 'TWD') THEN 1::numeric
+	ELSE 100::numeric
+END)::BIGINT)`
+
+const liveRecordsQuery = `SELECT id, ` + amountMinorFallbackExpression + ` AS amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`
+
 var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
+
+type captureTransactionContextKey struct{}
+
+const captureInsertSQL = `INSERT INTO captures (id, amount, amount_minor, status, currency, date, is_live)
+	VALUES ($1, ($2::NUMERIC / CASE WHEN $4 IN ('JPY', 'HUF', 'TWD') THEN 1 ELSE 100 END)::DOUBLE PRECISION,
+		$2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`
 
 var (
 	db           *sql.DB
@@ -42,10 +55,12 @@ var (
 	}
 
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
-		_, err := db.ExecContext(ctx, `INSERT INTO captures (id, amount, amount_minor, status, currency, date, is_live)
-			VALUES ($1, ($2::NUMERIC / CASE WHEN $4 IN ('JPY', 'HUF', 'TWD') THEN 1 ELSE 100 END)::DOUBLE PRECISION,
-				$2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
-			p.ID, p.AmountMinor, p.Status, p.Currency, p.Date, p.IsLive)
+		args := []any{p.ID, p.AmountMinor, p.Status, p.Currency, p.Date, p.IsLive}
+		if tx, ok := ctx.Value(captureTransactionContextKey{}).(*sql.Tx); ok {
+			_, err := tx.ExecContext(ctx, captureInsertSQL, args...)
+			return err
+		}
+		_, err := db.ExecContext(ctx, captureInsertSQL, args...)
 		return err
 	}
 )
@@ -213,6 +228,10 @@ func initDB(dbURL string) error {
 	if err != nil {
 		return fmt.Errorf("sql.Open: %w", err)
 	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(time.Minute)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -320,8 +339,8 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 	var failureMessage string
 	var persistenceErr error
 
-	runErr := orderLock(ctx, orderID, func() error {
-		status, err := verifyOrderStatus(ctx, token, orderID)
+	runErr := orderLock(ctx, orderID, func(lockCtx context.Context) error {
+		status, err := verifyOrderStatus(lockCtx, token, orderID)
 		if err != nil {
 			failureStatus = http.StatusBadGateway
 			failureMessage = "Failed to verify order status"
@@ -330,16 +349,16 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 
 		switch status {
 		case "COMPLETED":
-			payment, err = reconcileCapture(ctx, token, orderID)
+			payment, err = reconcileCapture(lockCtx, token, orderID)
 			if err != nil {
 				failureStatus = http.StatusBadGateway
 				failureMessage = "Reconcile failed"
 				return err
 			}
 		case "APPROVED":
-			payment, err = capturePayPalOrder(ctx, token, orderID)
+			payment, err = capturePayPalOrder(lockCtx, token, orderID)
 			if errors.Is(err, errOrderAlreadyCaptured) {
-				payment, err = reconcileCapture(ctx, token, orderID)
+				payment, err = reconcileCapture(lockCtx, token, orderID)
 				if err != nil {
 					failureStatus = http.StatusBadGateway
 					failureMessage = "Reconcile failed after PayPal reported an already-captured order"
@@ -362,7 +381,7 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 			return err
 		}
 
-		persistenceErr = persistCapture(ctx, payment)
+		persistenceErr = persistCapture(lockCtx, payment)
 		return nil
 	})
 	if runErr != nil && failureStatus == 0 {
@@ -376,7 +395,7 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 	return payment, failureStatus, failureMessage, persistenceErr, runErr
 }
 
-func withPostgresOrderAdvisoryLock(ctx context.Context, orderID string, fn func() error) error {
+func withPostgresOrderAdvisoryLock(ctx context.Context, orderID string, fn func(context.Context) error) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin capture lock transaction: %w", err)
@@ -385,7 +404,8 @@ func withPostgresOrderAdvisoryLock(ctx context.Context, orderID string, fn func(
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, orderID); err != nil {
 		return fmt.Errorf("acquire capture advisory lock: %w", err)
 	}
-	if err := fn(); err != nil {
+	lockedContext := context.WithValue(ctx, captureTransactionContextKey{}, tx)
+	if err := fn(lockedContext); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -431,7 +451,7 @@ func makeTransactionsHandler() http.HandlerFunc {
 }
 
 func getLiveRecords(ctx context.Context) ([]PaymentRecord, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`)
+	rows, err := db.QueryContext(ctx, liveRecordsQuery)
 	if err != nil {
 		return nil, err
 	}

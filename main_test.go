@@ -65,7 +65,7 @@ func mockReadError(t *testing.T) {
 func mockEndpoints(t *testing.T, verifyBody, captureBody, reconcileBody string) {
 	t.Helper()
 	saveTransport(t)
-	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error { return fn() })
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error { return fn(ctx) })
 	getCount := 0
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
 		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
@@ -416,7 +416,7 @@ func TestParseCaptureFromBody_NotCompleted(t *testing.T) {
 	}
 }
 
-func setOrderLock(t *testing.T, lock func(context.Context, string, func() error) error) {
+func setOrderLock(t *testing.T, lock func(context.Context, string, func(context.Context) error) error) {
 	t.Helper()
 	original := orderLock
 	orderLock = lock
@@ -425,7 +425,7 @@ func setOrderLock(t *testing.T, lock func(context.Context, string, func() error)
 
 func TestCaptureOrderHandler_AlreadyCapturedResponseReconciles(t *testing.T) {
 	saveTransport(t)
-	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error { return fn() })
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error { return fn(ctx) })
 	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
 	getCount := 0
 	captureCalls := 0
@@ -482,10 +482,10 @@ func TestCaptureOrderHandler_AlreadyCapturedResponseReconciles(t *testing.T) {
 func TestCaptureOrderHandler_ConcurrentRequestsCaptureOnce(t *testing.T) {
 	saveTransport(t)
 	var orderMutex sync.Mutex
-	setOrderLock(t, func(ctx context.Context, orderID string, fn func() error) error {
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error {
 		orderMutex.Lock()
 		defer orderMutex.Unlock()
-		return fn()
+		return fn(ctx)
 	})
 
 	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPWINNER","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
@@ -606,6 +606,73 @@ func TestCaptureOrderHandler_WrongAmount(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("Expected 502 for wrong amount, got %d, body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLiveRecordsQueryUsesLegacyMinorFallback(t *testing.T) {
+	if !strings.Contains(liveRecordsQuery, amountMinorFallbackExpression) {
+		t.Fatalf("live-record query does not use legacy amount fallback: %s", liveRecordsQuery)
+	}
+}
+
+func TestCaptureOrderHandler_PersistenceFailureRetryReconciles(t *testing.T) {
+	saveTransport(t)
+	setOrderLock(t, func(ctx context.Context, orderID string, fn func(context.Context) error) error { return fn(ctx) })
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPRETRY","status":"COMPLETED","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	orderCompleted := false
+	captureCalls := 0
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		}
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/v2/checkout/orders/") {
+			if orderCompleted {
+				return resp(http.StatusOK, completedOrder), nil
+			}
+			return resp(http.StatusOK, `{"status":"APPROVED"}`), nil
+		}
+		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/capture") {
+			captureCalls++
+			orderCompleted = true
+			return resp(http.StatusOK, completedOrder), nil
+		}
+		return resp(http.StatusNotFound, `{}`), nil
+	})
+
+	persistCalls := 0
+	rows := map[string]PaymentRecord{}
+	originalPersist := persistCapture
+	persistCapture = func(ctx context.Context, payment PaymentRecord) error {
+		persistCalls++
+		if persistCalls == 1 {
+			return errors.New("simulated DB insert failure")
+		}
+		rows[payment.ID] = payment
+		return nil
+	}
+	t.Cleanup(func() { persistCapture = originalPersist })
+
+	handler := makeCaptureOrderHandler("fake", "fake")
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		return w
+	}
+	first := request()
+	if first.Code != http.StatusInternalServerError || !strings.Contains(first.Body.String(), "capture_succeeded_persistence_pending") {
+		t.Fatalf("first request = %d %s, want persistence-pending 500", first.Code, first.Body.String())
+	}
+	second := request()
+	if second.Code != http.StatusOK {
+		t.Fatalf("retry = %d %s, want 200", second.Code, second.Body.String())
+	}
+	var payment PaymentRecord
+	if err := json.Unmarshal(second.Body.Bytes(), &payment); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if payment.ID != "CAPRETRY" || captureCalls != 1 || persistCalls != 2 || len(rows) != 1 {
+		t.Fatalf("retry payment=%+v captures=%d persists=%d rows=%d; want reconciled single capture and row", payment, captureCalls, persistCalls, len(rows))
 	}
 }
 
