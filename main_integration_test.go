@@ -160,3 +160,33 @@ func TestPostgresLockPersistenceFailureRetryReconciles(t *testing.T) {
 		t.Fatalf("payment=%+v captures=%d persists=%d rows=%d; want one capture, retry persistence, and one row", payment, captureCalls, persistCalls, len(storedRows))
 	}
 }
+
+func TestPostgresWebhookReceiptDeduplicates(t *testing.T) {
+	testDB := openPostgresIntegrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	eventID := fmt.Sprintf("integration-webhook-%d", time.Now().UnixNano())
+	payload := []byte(fmt.Sprintf(`{"id":%q,"event_type":"PAYMENT.CAPTURE.COMPLETED"}`, eventID))
+	created, err := insertWebhookReceipt(ctx, testDB, eventID, "PAYMENT.CAPTURE.COMPLETED", payload)
+	if err != nil {
+		t.Fatalf("insert webhook receipt: %v", err)
+	}
+	if !created {
+		t.Fatal("first webhook receipt insert was reported as duplicate")
+	}
+	created, err = insertWebhookReceipt(ctx, testDB, eventID, "PAYMENT.CAPTURE.COMPLETED", payload)
+	if err != nil {
+		t.Fatalf("insert duplicate webhook receipt: %v", err)
+	}
+	if created {
+		t.Fatal("duplicate event_id insert created a second receipt")
+	}
+	var count int
+	if err := testDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM webhook_events WHERE event_id = $1`, eventID).Scan(&count); err != nil {
+		t.Fatalf("count webhook receipts: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("webhook receipt count = %d, want exactly one", count)
+	}
+	_, _ = testDB.ExecContext(ctx, `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+}

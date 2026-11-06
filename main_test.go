@@ -641,6 +641,21 @@ func TestAttemptsMigrationIsAdditiveAndHasRequiredColumns(t *testing.T) {
 	}
 }
 
+func TestWebhookReceiptMigrationIsAdditiveAndDeduplicated(t *testing.T) {
+	contents, err := os.ReadFile("migrations/003_webhook_events.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.ToLower(string(contents))
+	for _, fragment := range []string{"create table if not exists webhook_events", "event_id text primary key", "event_type text not null", "payload jsonb not null", "webhook_events_received_at_idx"} {
+		if !strings.Contains(sqlText, fragment) {
+			t.Errorf("webhook receipt migration missing %q", fragment)
+		}
+	}
+	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "alter table") {
+		t.Fatal("webhook receipt migration must be additive")
+	}
+}
 func TestGroqErrorCodeIsShortAndRedacted(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1023,5 +1038,112 @@ func TestCaptureOrderHandler_RetryReconciles(t *testing.T) {
 	}
 	if persistCalled != 1 {
 		t.Errorf("Expected persist to be called once, got %d", persistCalled)
+	}
+}
+
+func TestPayPalWebhookHandlerVerifiesRawEventAndDeduplicates(t *testing.T) {
+	saveTransport(t)
+	rawEvent := []byte("{ \"id\":\"WH-EVENT-1\", \"event_type\":\"PAYMENT.CAPTURE.COMPLETED\",\"resource\":{\"id\":\"CAP-1\"} }")
+	var compactEvent bytes.Buffer
+	if err := json.Compact(&compactEvent, rawEvent); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string][]byte)
+	previousWriter := writeWebhookReceipt
+	writeWebhookReceipt = func(_ context.Context, eventID, eventType string, body []byte) (bool, error) {
+		if eventType != "PAYMENT.CAPTURE.COMPLETED" || !bytes.Equal(body, rawEvent) {
+			t.Errorf("stored webhook event type/body mismatch: type=%q body=%q", eventType, body)
+		}
+		if _, exists := seen[eventID]; exists {
+			return false, nil
+		}
+		seen[eventID] = append([]byte(nil), body...)
+		return true, nil
+	}
+	t.Cleanup(func() { writeWebhookReceipt = previousWriter })
+
+	verifyCalls := 0
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/v1/oauth2/token":
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		case "/v1/notifications/verify-webhook-signature":
+			verifyCalls++
+			if req.Header.Get("Authorization") != "Bearer fake-token" {
+				t.Errorf("verification authorization header = %q", req.Header.Get("Authorization"))
+			}
+			var payload struct {
+				AuthAlgo        string          `json:"auth_algo"`
+				CertURL         string          `json:"cert_url"`
+				TransmissionID  string          `json:"transmission_id"`
+				TransmissionSig string          `json:"transmission_sig"`
+				TransmissionAt  string          `json:"transmission_time"`
+				WebhookID       string          `json:"webhook_id"`
+				WebhookEvent    json.RawMessage `json:"webhook_event"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+				t.Errorf("decode signature verification payload: %v", err)
+			} else if payload.WebhookID != "WH-CONFIGURED" || string(payload.WebhookEvent) != compactEvent.String() || payload.TransmissionID != "tx-1" || payload.AuthAlgo != "SHA256withRSA" {
+				t.Errorf("signature verification payload mismatch: %+v event=%q", payload, payload.WebhookEvent)
+			}
+			return resp(http.StatusOK, `{"verification_status":"SUCCESS"}`), nil
+		default:
+			return resp(http.StatusNotFound, `{}`), nil
+		}
+	})
+
+	handler := makePayPalWebhookHandler("fake-client", "fake-secret", "WH-CONFIGURED")
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/webhooks/paypal", bytes.NewReader(rawEvent))
+		req.Header.Set("PayPal-Auth-Algo", "SHA256withRSA")
+		req.Header.Set("PayPal-Cert-Url", "https://api.sandbox.paypal.com/cert")
+		req.Header.Set("PayPal-Transmission-Id", "tx-1")
+		req.Header.Set("PayPal-Transmission-Sig", "signature")
+		req.Header.Set("PayPal-Transmission-Time", "2026-11-06T12:00:00Z")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		return w
+	}
+	first := request()
+	second := request()
+	if first.Code != http.StatusOK || strings.Contains(first.Body.String(), `"duplicate":true`) {
+		t.Fatalf("first webhook response = %d %s", first.Code, first.Body.String())
+	}
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"duplicate":true`) {
+		t.Fatalf("duplicate webhook response = %d %s", second.Code, second.Body.String())
+	}
+	if verifyCalls != 2 || len(seen) != 1 {
+		t.Fatalf("signature verifications=%d stored receipts=%d; want 2 verifications and one receipt", verifyCalls, len(seen))
+	}
+}
+
+func TestPayPalWebhookHandlerRejectsInvalidSignature(t *testing.T) {
+	saveTransport(t)
+	previousWriter := writeWebhookReceipt
+	writeCalls := 0
+	writeWebhookReceipt = func(context.Context, string, string, []byte) (bool, error) {
+		writeCalls++
+		return true, nil
+	}
+	t.Cleanup(func() { writeWebhookReceipt = previousWriter })
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		}
+		if req.URL.Path == "/v1/notifications/verify-webhook-signature" {
+			return resp(http.StatusOK, `{"verification_status":"FAILURE"}`), nil
+		}
+		return resp(http.StatusNotFound, `{}`), nil
+	})
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/paypal", strings.NewReader(`{"id":"WH-EVENT-2","event_type":"PAYMENT.CAPTURE.COMPLETED"}`))
+	req.Header.Set("PayPal-Auth-Algo", "SHA256withRSA")
+	req.Header.Set("PayPal-Cert-Url", "https://api.sandbox.paypal.com/cert")
+	req.Header.Set("PayPal-Transmission-Id", "tx-2")
+	req.Header.Set("PayPal-Transmission-Sig", "signature")
+	req.Header.Set("PayPal-Transmission-Time", "2026-11-06T12:00:00Z")
+	w := httptest.NewRecorder()
+	makePayPalWebhookHandler("fake-client", "fake-secret", "WH-CONFIGURED").ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || writeCalls != 0 {
+		t.Fatalf("invalid signature response=%d writes=%d, want 401 and no receipt", w.Code, writeCalls)
 	}
 }

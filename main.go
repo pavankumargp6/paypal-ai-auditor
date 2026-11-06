@@ -348,6 +348,8 @@ func main() {
 	mux.HandleFunc("/api/capture-order", makeCaptureOrderHandler(clientID, clientSecret))
 	mux.HandleFunc("/api/spend-intelligence", makeSpendHandler(groqKey))
 	mux.HandleFunc("/api/transactions", makeTransactionsHandler())
+	webhookID := strings.TrimSpace(os.Getenv("PAYPAL_WEBHOOK_ID"))
+	mux.HandleFunc("/webhooks/paypal", makePayPalWebhookHandler(clientID, clientSecret, webhookID))
 
 	port := os.Getenv("PORT")
 	if port == "" {
