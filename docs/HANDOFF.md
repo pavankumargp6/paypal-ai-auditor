@@ -11,6 +11,7 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 ## Done
 
 - `ccfdac0 feat: process PayPal capture webhooks idempotently` — revised migration 003 with additive resource/processing fields and an index; process completed, denied, and refunded capture webhooks into attempts with transactional deduplication and retryable failures; preserve raw signed JSON bytes and require exact PayPal `SUCCESS`; tightened decline-rate codes, documented payer-data and decline semantics, and added unit plus PostgreSQL retry coverage. Local vet and race suite passed; all five PostgreSQL integration tests skipped locally because the dedicated test URL is unset.
+- `ee356e2 docs: record webhook processing handoff` — recorded the webhook implementation and next verification step.
 - `2576ea8 docs: record sandbox findings and ignore executables` — added Sandbox negative-test findings, scanned the document for credential-shaped content, and ignored `*.exe`. The pre-existing executable is not tracked.
 - `5f61a4a feat: store payment amounts in minor units` — added integer minor-unit parsing, string-encoded JSON fields, exact frontend formatting, and the additive `amount_minor` migration.
 - `6f0c387 fix: serialize PayPal order captures` — added deterministic `PayPal-Request-Id`, PostgreSQL per-order advisory locking, already-captured reconciliation, and a 12-request mocked concurrency test.
@@ -30,7 +31,7 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 
 ## In progress / next step
 
-- Push `ccfdac0` and confirm the GitHub Actions run. The CI workflow applies migrations 001–003, then runs all PostgreSQL integration tests with verbose names. Stop before starting the agent loop.
+- Both commits are pushed to `origin/feat/revenue-guardian`; `HEAD` and the remote ref matched at `ee356e204c4bfee82a9cb4fa2aa37d03af1f9bdd`. CI is triggered by pushes to `feat/**`. Check the Actions page at https://github.com/pavankumargp6/paypal-ai-auditor/actions; this environment could not retrieve the new push run status. The CI workflow applies migrations 001–003, then runs all PostgreSQL integration tests with verbose names. Stop before starting the agent loop.
 - Migration 003 was revised with additive `resource_id`, `processed_at`, and `process_error` columns plus a `resource_id` index. The approved command was `go run ./cmd/migrate ./migrations/003_webhook_events.sql`; it was applied to the user's Render database. The runner reported 0 rows and 0 minor units before and after. Read-only schema inspection showed `event_id`, `event_type`, `resource_id`, `payload`, `received_at`, `processed_at`, and `process_error`; `schema_migrations` contains 001, 002, and 003.
 - Decline rate now uses only `INSTRUMENT_DECLINED`, `PAYER_CANNOT_PAY`, and `PAYMENT_DENIED` as numerator codes, among real capture-stage attempts. README states these codes come from sandbox negative testing, defines recoverable as retrying with another funding source without guaranteeing recovery, and warns that webhook payloads may contain payer data (sandbox only).
 - Current local checks: `go vet ./...` passed; `go test -race -count=1 ./...` passed (`ok paypal-ai-auditor 2.428s`). The preceding verbose test run showed all five PostgreSQL tests skipped because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
