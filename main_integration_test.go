@@ -328,12 +328,13 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	capture1, capture2, repeatedID := "DETECT-CAP-A-"+suffix, "DETECT-CAP-B-"+suffix, "DETECT-CAP-X-"+suffix
 	eventID := "DETECT-EVENT-" + suffix
 	fingerprint := "action-test-" + suffix
+	unsafeFingerprint := fingerprint + "-unsafe"
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	t.Cleanup(func() {
-		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM actions WHERE finding_id IN (SELECT id FROM findings WHERE fingerprint = $1)`, fingerprint)
-		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM findings WHERE fingerprint = $1 OR fingerprint IN ($2, $3, $4)`,
-			fingerprint, "duplicate_capture:order:"+fingerprintToken(orderID), "duplicate_capture:capture:"+fingerprintToken(repeatedID), "fee_mismatch:"+fingerprintToken(capture1))
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM actions WHERE finding_id IN (SELECT id FROM findings WHERE fingerprint IN ($1, $2))`, fingerprint, unsafeFingerprint)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM findings WHERE fingerprint IN ($1, $2, $3, $4, $5)`,
+			fingerprint, unsafeFingerprint, "duplicate_capture:order:"+fingerprintToken(orderID), "duplicate_capture:capture:"+fingerprintToken(repeatedID), "fee_mismatch:"+fingerprintToken(capture1))
 		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM attempts WHERE capture_id IN ($1, $2, $3)`, capture1, capture2, repeatedID)
 		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
 	})
@@ -436,6 +437,29 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	}
 	if after.LostMinor != baseline.LostMinor || after.RecoverableMinor != baseline.RecoverableMinor || after.RecoveredMinor != baseline.RecoveredMinor+200 {
 		t.Fatalf("leakage score before=%+v after=%+v; expected 200 minor units to move from open to actioned", baseline, after)
+	}
+	var unsafeFindingID, unsafeActionID int64
+	if err := testDB.QueryRowContext(ctx, `INSERT INTO findings (fingerprint, detector, amount_minor, currency, evidence)
+		VALUES ($1, 'duplicate_capture', 2500, 'USD', '{}'::jsonb) RETURNING id`, unsafeFingerprint).Scan(&unsafeFindingID); err != nil {
+		t.Fatalf("insert finding for unsafe action check: %v", err)
+	}
+	if err := testDB.QueryRowContext(ctx, `INSERT INTO actions (finding_id, action_type, status, result)
+		VALUES ($1, 'unsafe_test', 'proposed', '{"events":[],"money_moved":true,"execution_mode":"record_only"}'::jsonb) RETURNING id`, unsafeFindingID).Scan(&unsafeActionID); err != nil {
+		t.Fatalf("insert unsafe action fixture: %v", err)
+	}
+	unsafeApproveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", unsafeActionID), nil)
+	unsafeApproveResponse := httptest.NewRecorder()
+	makeApproveActionHandler().ServeHTTP(unsafeApproveResponse, unsafeApproveRequest)
+	if unsafeApproveResponse.Code != http.StatusConflict {
+		t.Fatalf("unsafe action approval status=%d body=%s, want 409", unsafeApproveResponse.Code, unsafeApproveResponse.Body.String())
+	}
+	var unsafeStatus, unsafeFindingStatus string
+	if err := testDB.QueryRowContext(ctx, `SELECT status, (SELECT status FROM findings WHERE id = $2) FROM actions WHERE id = $1`, unsafeActionID, unsafeFindingID).
+		Scan(&unsafeStatus, &unsafeFindingStatus); err != nil {
+		t.Fatalf("read unsafe action statuses: %v", err)
+	}
+	if unsafeStatus != "proposed" || unsafeFindingStatus != "open" {
+		t.Fatalf("unsafe approval changed state: action=%q finding=%q", unsafeStatus, unsafeFindingStatus)
 	}
 }
 

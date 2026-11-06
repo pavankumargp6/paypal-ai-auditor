@@ -14,6 +14,26 @@
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
         .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
         .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
+        .leakage-section, .findings-section { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 24px; }
+        .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+        .section-heading h2 { margin: 0; color: #0f172a; }
+        .live-score-grid, .simulated-score-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+        .score-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 18px; }
+        .score-card .card-value { font-size: 2rem; }
+        .simulated-score { border-top: 1px solid #e2e8f0; margin-top: 18px; padding-top: 14px; color: #64748b; }
+        .simulated-score-grid { gap: 10px; }
+        .simulated-score-grid .score-card { padding: 12px; background: #f8fafc; border-style: dashed; }
+        .simulated-score-grid .card-value { font-size: 1.2rem; color: #64748b; }
+        .score-note, .muted { color: #64748b; font-size: 0.85rem; }
+        .findings-table-wrap { overflow-x: auto; }
+        .findings-table { width: 100%; border-collapse: collapse; text-align: left; }
+        .findings-table th, .findings-table td { padding: 12px 10px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+        .findings-table th { color: #64748b; font-size: 0.8rem; text-transform: uppercase; }
+        .simulated-badge { display: inline-block; color: #92400e; background: #fef3c7; border-radius: 999px; padding: 3px 8px; font-size: 0.72rem; font-weight: 700; }
+        .action-btn, .seed-demo-btn { background: #0f766e; color: white; border: 0; border-radius: 6px; padding: 9px 12px; cursor: pointer; font-weight: 600; white-space: nowrap; }
+        .action-btn:disabled, .seed-demo-btn:disabled { opacity: 0.55; cursor: wait; }
+        .seed-demo-btn { background: #475569; }
+        .action-feedback { margin-top: 5px; color: #64748b; font-size: 0.75rem; }
         .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
         .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
@@ -22,6 +42,12 @@
         .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
         .paypal-btn:hover { background-color: #f2ba36; }
         .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        @media (max-width: 760px) {
+            body { padding: 20px; }
+            .live-score-grid, .simulated-score-grid { grid-template-columns: 1fr; }
+            .section-heading { align-items: flex-start; flex-direction: column; }
+            .summary-grid { grid-template-columns: repeat(2, 1fr); }
+        }
     </style>
 </head>
 <body>
@@ -32,6 +58,45 @@
             <div id="ai-insight-citations" style="margin-top:6px; color:#64748b; font-size:0.75rem;"></div>
         </div>
     </div>
+
+    <section class="leakage-section" aria-labelledby="leakage-title">
+        <div class="section-heading">
+            <div>
+                <h2 id="leakage-title">Leakage Score <span class="muted">(Live)</span></h2>
+                <div class="score-note">Amounts are minor-unit accurate. Recovered follows the actioned status; it does not mean a refund was sent.</div>
+            </div>
+        </div>
+        <div class="live-score-grid">
+            <div class="score-card"><div class="card-title">Lost</div><div class="card-value" id="leakage-lost">$0.00</div></div>
+            <div class="score-card"><div class="card-title">Recoverable</div><div class="card-value" id="leakage-recoverable">$0.00</div></div>
+            <div class="score-card"><div class="card-title">Recovered</div><div class="card-value" id="leakage-recovered">$0.00</div></div>
+        </div>
+        <div class="simulated-score">
+            <strong>Synthetic Demo (simulated; excluded from live totals)</strong>
+            <div class="simulated-score-grid" style="margin-top:10px;">
+                <div class="score-card"><div class="card-title">Simulated Lost</div><div class="card-value" id="simulated-leakage-lost">$0.00</div></div>
+                <div class="score-card"><div class="card-title">Simulated Recoverable</div><div class="card-value" id="simulated-leakage-recoverable">$0.00</div></div>
+                <div class="score-card"><div class="card-title">Simulated Recovered</div><div class="card-value" id="simulated-leakage-recovered">$0.00</div></div>
+            </div>
+        </div>
+    </section>
+
+    <section class="findings-section" aria-labelledby="findings-title">
+        <div class="section-heading">
+            <div>
+                <h2 id="findings-title">Open Findings</h2>
+                <div class="score-note">Deterministic Go detectors classify findings. Approving records a demo action only; no money moves.</div>
+            </div>
+            <button class="seed-demo-btn" id="seed-demo-btn" type="button" onclick="seedDemoFinding()">Seed Demo Finding (Simulated)</button>
+        </div>
+        <div id="findings-status" class="muted" role="status" style="margin-bottom:10px;"></div>
+        <div class="findings-table-wrap">
+            <table class="findings-table">
+                <thead><tr><th>Finding</th><th>Amount</th><th>Capture IDs / Evidence</th><th>Explanation</th><th>Action</th></tr></thead>
+                <tbody id="findings-body"><tr><td colspan="5" class="muted">Loading findings…</td></tr></tbody>
+            </table>
+        </div>
+    </section>
 
     <div class="summary-grid">
         <div class="card">
@@ -184,6 +249,127 @@
                 console.error("[metrics] FAILED:", err);
                 document.getElementById('ai-insight').innerText = "⚠️ AI metrics unavailable (grid still works)";
             }
+
+            await refreshFindingsDashboard();
+        }
+
+        async function apiJSON(url, options) {
+            const response = await fetch(url, options);
+            let data;
+            try { data = await response.json(); } catch (e) { data = {}; }
+            if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+            return data;
+        }
+
+        async function refreshFindingsDashboard() {
+            const status = document.getElementById('findings-status');
+            try {
+                const [score, findings] = await Promise.all([
+                    apiJSON('/api/findings/leakage-score'),
+                    apiJSON('/api/findings')
+                ]);
+                document.getElementById('leakage-lost').innerText = formatMinorCurrency(score.lost_minor, 'USD');
+                document.getElementById('leakage-recoverable').innerText = formatMinorCurrency(score.recoverable_minor, 'USD');
+                document.getElementById('leakage-recovered').innerText = formatMinorCurrency(score.recovered_minor, 'USD');
+                document.getElementById('simulated-leakage-lost').innerText = formatMinorCurrency(score.simulated_lost_minor, 'USD');
+                document.getElementById('simulated-leakage-recoverable').innerText = formatMinorCurrency(score.simulated_recoverable_minor, 'USD');
+                document.getElementById('simulated-leakage-recovered').innerText = formatMinorCurrency(score.simulated_recovered_minor, 'USD');
+                renderOpenFindings(findings.filter(finding => finding.status === 'open'));
+                status.innerText = '';
+            } catch (err) {
+                console.error('[findings] FAILED:', err);
+                status.innerText = `Findings unavailable: ${err.message}`;
+                document.getElementById('findings-body').innerHTML = '<tr><td colspan="5" class="muted">Could not load findings.</td></tr>';
+            }
+        }
+
+        function renderOpenFindings(findings) {
+            const tbody = document.getElementById('findings-body');
+            tbody.replaceChildren();
+            if (!findings.length) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = 5;
+                cell.className = 'muted';
+                cell.textContent = 'No open findings.';
+                row.appendChild(cell);
+                tbody.appendChild(row);
+                return;
+            }
+
+            for (const finding of findings) {
+                const row = document.createElement('tr');
+                const titleCell = document.createElement('td');
+                titleCell.textContent = finding.detector.replaceAll('_', ' ');
+                if (finding.evidence?.is_synthetic) {
+                    const badge = document.createElement('div');
+                    badge.className = 'simulated-badge';
+                    badge.textContent = 'Synthetic Demo';
+                    titleCell.appendChild(document.createElement('br'));
+                    titleCell.appendChild(badge);
+                }
+
+                const amountCell = document.createElement('td');
+                amountCell.textContent = formatMinorCurrency(finding.amount_minor, finding.currency || 'USD');
+                const evidenceCell = document.createElement('td');
+                const captureIDs = finding.evidence?.capture_ids || (finding.evidence?.captures || []).map(capture => capture.capture_id);
+                evidenceCell.textContent = captureIDs.length ? captureIDs.join(', ') : (finding.evidence?.paypal_order_id || 'Evidence recorded');
+                const explanationCell = document.createElement('td');
+                explanationCell.textContent = finding.explanation || 'No explanation available.';
+                const actionCell = document.createElement('td');
+                const approveButton = document.createElement('button');
+                approveButton.className = 'action-btn';
+                approveButton.type = 'button';
+                approveButton.textContent = 'Approve Action';
+                approveButton.addEventListener('click', () => approveFinding(finding.id, approveButton));
+                actionCell.appendChild(approveButton);
+                const feedback = document.createElement('div');
+                feedback.className = 'action-feedback';
+                feedback.setAttribute('aria-live', 'polite');
+                actionCell.appendChild(feedback);
+
+                for (const cell of [titleCell, amountCell, evidenceCell, explanationCell, actionCell]) row.appendChild(cell);
+                tbody.appendChild(row);
+            }
+        }
+
+        async function seedDemoFinding() {
+            const button = document.getElementById('seed-demo-btn');
+            const status = document.getElementById('findings-status');
+            button.disabled = true;
+            status.innerText = 'Seeding a simulated finding…';
+            try {
+                const result = await apiJSON('/api/findings/seed-demo', { method: 'POST' });
+                status.innerText = result.created
+                    ? 'Synthetic Demo finding added. No PayPal transaction was made.'
+                    : `Synthetic Demo finding already exists (${result.finding.status}).`;
+                await refreshFindingsDashboard();
+            } catch (err) {
+                status.innerText = `Could not seed demo finding: ${err.message}`;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function approveFinding(findingID, button) {
+            const feedback = button.parentElement.querySelector('.action-feedback');
+            button.disabled = true;
+            feedback.innerText = 'Recording action…';
+            try {
+                const action = await apiJSON(`/api/findings/${encodeURIComponent(findingID)}/action`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action_type: 'record_recovery', description: 'Demo approval recorded; no money moved.' })
+                });
+                if (action.money_moved !== false) throw new Error('Safety check failed: proposal reports money moved.');
+                const approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, { method: 'POST' });
+                if (approved.money_moved !== false) throw new Error('Safety check failed: approval reports money moved.');
+                document.getElementById('findings-status').innerText = 'Action recorded as executed. No money moved.';
+                await refreshDashboard();
+            } catch (err) {
+                feedback.innerText = err.message;
+                button.disabled = false;
+            }
         }
 
         function applyFilter() {
@@ -251,3 +437,72 @@
     </script>
 </body>
 </html>
+<!-- LEAKAGE SCORE UI INJECTED BY POWERSHELL -->
+<div id="leakage-score-section" style="background: #fff; border: 1px solid #ddd; padding: 20px; border-radius: 8px; margin: 20px auto; max-width: 1200px; font-family: sans-serif;">
+    <h2 style="margin-top: 0; color: #333;">Revenue Leakage Score</h2>
+    <div style="display: flex; gap: 40px;">
+        <div><div style="color: #666; font-size: 14px;">Lost</div><div style="font-size: 28px; font-weight: bold; color: #d32f2f;" id="score-lost">.00</div></div>
+        <div><div style="color: #666; font-size: 14px;">Recoverable</div><div style="font-size: 28px; font-weight: bold; color: #f57c00;" id="score-recoverable">.00</div></div>
+        <div><div style="color: #666; font-size: 14px;">Recovered</div><div style="font-size: 28px; font-weight: bold; color: #388e3c;" id="score-recovered">.00</div></div>
+    </div>
+    <div style="margin-top: 15px;">
+        <button onclick="seedDemo()" style="padding: 8px 16px; background: #0070ba; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Seed Demo Leak (125)</button>
+    </div>
+    <div id="findings-list" style="margin-top: 20px;"></div>
+</div>
+<script>
+async function updateLeakageScore() {
+    try {
+        const res = await fetch('/api/findings/leakage-score');
+        const data = await res.json();
+        const lost = data.simulated_lost_minor || data.lost_minor || 0;
+        const rec = data.simulated_recoverable_minor || data.recoverable_minor || 0;
+        const recov = data.simulated_recovered_minor || data.recovered_minor || 0;
+        document.getElementById('score-lost').innerText = $;
+        document.getElementById('score-recoverable').innerText = $;
+        document.getElementById('score-recovered').innerText = $;
+    } catch (e) { console.error("Score error:", e); }
+}
+async function updateFindings() {
+    try {
+        const res = await fetch('/api/findings');
+        const findings = await res.json();
+        const list = document.getElementById('findings-list');
+        list.innerHTML = '';
+        if (!findings || findings.length === 0) {
+            list.innerHTML = '<p style="color: #666;">No active leaks detected.</p>';
+            return;
+        }
+        findings.forEach(f => {
+            const div = document.createElement('div');
+            div.style = "padding: 10px; border: 1px solid #eee; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border-radius: 4px;";
+            div.innerHTML = 
+                <div>
+                    <strong style="text-transform: capitalize; color: #333;"></strong><br>
+                    <span style="color: #666; font-size: 12px;">Amount: 1{(f.amount_minor / 100).toFixed(2)} | Status: </span>
+                </div>
+                <button onclick="approveAction()" style="padding: 6px 12px; background: #ffc439; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Approve Refund</button>
+            ;
+            list.appendChild(div);
+        });
+    } catch (e) { console.error("Findings error:", e); }
+}
+async function seedDemo() {
+    await fetch('/api/findings/seed-demo', { method: 'POST' });
+    updateLeakageScore(); updateFindings();
+}
+async function approveAction(findingId) {
+    try {
+        const propRes = await fetch(/api/findings//action, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action_type: "flag_refund", actor: "Demo User"})
+        });
+        if (!propRes.ok) throw new Error("Propose failed");
+        const propData = await propRes.json();
+        await fetch(/api/actions//approve, { method: 'POST' });
+        updateLeakageScore(); updateFindings();
+    } catch (e) { alert("Error approving action: " + e.message); }
+}
+document.addEventListener("DOMContentLoaded", () => { updateLeakageScore(); updateFindings(); });
+</script>
+<!-- END LEAKAGE SCORE UI -->
