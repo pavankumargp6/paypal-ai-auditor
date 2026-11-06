@@ -10,6 +10,8 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 
 ## Done
 
+- `1f4d0fd docs: record webhook concurrency test` — recorded the PostgreSQL concurrency test and its local skip status.
+- CI run [#42237267272](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42237267272) passed for commit `1f4d0fd`. Migrations 001–003 and the verbose race-test step succeeded with the configured PostgreSQL service; all six integration tests, including `TestPostgresConcurrentDuplicateWebhookPostsWriteOneAttempt`, ran rather than skipped.
 - `01ab71e test: serialize concurrent duplicate webhook deliveries` — added the env-gated PostgreSQL test that sends two simultaneous POSTs with the same event ID, observes the second session blocked on `SELECT ... FOR UPDATE`, and asserts exactly one attempt insert and row. Local vet and race tests passed; PostgreSQL case skips locally without the dedicated DB URL.
 - `ccfdac0 feat: process PayPal capture webhooks idempotently` — revised migration 003 with additive resource/processing fields and an index; process completed, denied, and refunded capture webhooks into attempts with transactional deduplication and retryable failures; preserve raw signed JSON bytes and require exact PayPal `SUCCESS`; tightened decline-rate codes, documented payer-data and decline semantics, and added unit plus PostgreSQL retry coverage. Local vet and race suite passed; all five PostgreSQL integration tests skipped locally because the dedicated test URL is unset.
 - `ee356e2 docs: record webhook processing handoff` — recorded the webhook implementation and next verification step.
@@ -33,7 +35,7 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 
 ## In progress / next step
 
-- Push commit `01ab71e` and confirm `TestPostgresConcurrentDuplicateWebhookPostsWriteOneAttempt` passes in CI, then pause. No agent loop work is authorized yet.
+- The concurrent duplicate-delivery test is green in CI run #42237267272. Stop here before the agent loop.
 - At the previous pushed revision, `HEAD` and the remote ref matched at `9da3f2afa8942546b6194e59ca0051998ab50eed`. GitHub Actions run [#42235597732](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42235597732) passed after applying migrations 001–003. The workflow sets `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`, so the five PostgreSQL integration tests in that revision ran rather than skipped. The new concurrent duplicate-delivery test awaits CI.
 - Migration 003 was revised with additive `resource_id`, `processed_at`, and `process_error` columns plus a `resource_id` index. The approved command was `go run ./cmd/migrate ./migrations/003_webhook_events.sql`; it was applied to the user's Render database. The runner reported 0 rows and 0 minor units before and after. Read-only schema inspection showed `event_id`, `event_type`, `resource_id`, `payload`, `received_at`, `processed_at`, and `process_error`; `schema_migrations` contains 001, 002, and 003.
 - Decline rate now uses only `INSTRUMENT_DECLINED`, `PAYER_CANNOT_PAY`, and `PAYMENT_DENIED` as numerator codes, among real capture-stage attempts. README states these codes come from sandbox negative testing, defines recoverable as retrying with another funding source without guaranteeing recovery, and warns that webhook payloads may contain payer data (sandbox only).
