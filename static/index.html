@@ -45,7 +45,8 @@
         </div>
         <div class="card">
             <div class="card-title">Decline Rate</div>
-            <div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div>
+            <div class="card-value" id="decline-rate" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">No data yet</div>
+            <div style="color:#64748b; font-size:0.75rem; margin-top:6px;">Reason codes come from sandbox negative testing. Seeded failures are simulated.</div>
         </div>
     </div>
 
@@ -171,6 +172,9 @@
                 document.getElementById('total-revenue').innerText = formatMinorCurrency(intel.total_captured_minor, 'USD');
                 document.getElementById('total-success').innerText = intel.live_success || 0;
                 document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;
+                document.getElementById('decline-rate').innerText = intel.decline_rate_available
+                    ? `${Number(intel.decline_rate_percent).toFixed(1)}%`
+                    : "No data yet";
             } catch (err) {
                 console.error("[metrics] FAILED:", err);
                 document.getElementById('ai-insight').innerText = "⚠️ AI metrics unavailable (grid still works)";

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -195,6 +196,9 @@ func TestDashboardUsesMinorUnitAPIFields(t *testing.T) {
 		`formatMinorCurrency(intel.total_captured_minor, 'USD')`,
 		`BigInt(minor ?? "0")`,
 		`style: "currency", currency`,
+		`id="decline-rate"`,
+		`intel.decline_rate_percent`,
+		`"No data yet"`,
 	} {
 		if !strings.Contains(html, fragment) {
 			t.Errorf("dashboard is missing minor-unit contract %q", fragment)
@@ -575,6 +579,94 @@ func TestCachedAIInsightIsKeyedAndExpiresAfterOneMinute(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("Groq calls after summary changed = %d, want 2", calls)
+	}
+}
+
+func TestAttemptOutcomesPreservePayPalDeclineReasons(t *testing.T) {
+	tests := []struct {
+		issue   string
+		outcome string
+	}{
+		{issue: "INSTRUMENT_DECLINED", outcome: "declined"},
+		{issue: "PAYER_CANNOT_PAY", outcome: "declined"},
+		{issue: "PAYMENT_DENIED", outcome: "declined"},
+		{issue: "DUPLICATE_INVOICE_ID", outcome: "failed"},
+		{issue: "ORDER_ALREADY_CAPTURED", outcome: "reconciled"},
+		{issue: "UNCLASSIFIED", outcome: "failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.issue, func(t *testing.T) {
+			err := &PayPalAPIError{HTTPStatus: http.StatusUnprocessableEntity, ReasonCode: tc.issue, ReasonDetail: "sandbox test response"}
+			attempt := attemptFromPayPalError("capture", 2500, "USD", err)
+			if attempt.Outcome != tc.outcome || attempt.ReasonCode != tc.issue || attempt.HTTPStatus == nil || *attempt.HTTPStatus != http.StatusUnprocessableEntity {
+				t.Fatalf("attempt = %+v, want outcome %q with HTTP 422", attempt, tc.outcome)
+			}
+		})
+	}
+	emptyBody := attemptFromPayPalError("capture", 2500, "USD", newPayPalAPIError(http.StatusForbidden, nil))
+	if emptyBody.Outcome != "failed" || emptyBody.ReasonCode != "UNCLASSIFIED" || emptyBody.HTTPStatus == nil || *emptyBody.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("empty 403 attempt = %+v, want failed UNCLASSIFIED HTTP 403", emptyBody)
+	}
+}
+
+func TestDeclineRateNoDataAndCalculation(t *testing.T) {
+	if rate, available := declineRate(0, 0); available || rate != 0 {
+		t.Fatalf("empty decline rate = %v/%v, want unavailable", rate, available)
+	}
+	if rate, available := declineRate(2, 5); !available || rate != 40 {
+		t.Fatalf("decline rate = %v/%v, want 40%% available", rate, available)
+	}
+	if !strings.Contains(declineRateQuery, "stage = 'capture'") || !strings.Contains(declineRateQuery, "is_synthetic = FALSE") || !strings.Contains(declineRateQuery, "outcome = 'declined'") {
+		t.Fatalf("decline-rate query must count real capture attempts only: %s", declineRateQuery)
+	}
+}
+
+func TestAttemptsMigrationIsAdditiveAndHasRequiredColumns(t *testing.T) {
+	contents, err := os.ReadFile("migrations/002_attempts.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.ToLower(string(contents))
+	for _, column := range []string{"stage text not null", "outcome text not null", "reason_code text not null", "reason_detail text not null", "http_status integer", "amount_minor bigint not null", "currency text not null", "is_synthetic boolean not null", "created_at timestamptz not null"} {
+		if !strings.Contains(sqlText, column) {
+			t.Errorf("migration 002 missing required column declaration %q", column)
+		}
+	}
+	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "alter table") {
+		t.Fatal("migration 002 must only add the attempts table and index")
+	}
+}
+
+func TestAttemptLoggingFailureDoesNotBreakCapture(t *testing.T) {
+	previousDB := db
+	db = &sql.DB{}
+	t.Cleanup(func() { db = previousDB })
+	previousWriter := writePaymentAttempt
+	logged := make(chan PaymentAttempt, 4)
+	writePaymentAttempt = func(_ context.Context, _ *sql.DB, attempt PaymentAttempt) error {
+		logged <- attempt
+		return errors.New("simulated attempt table outage")
+	}
+	t.Cleanup(func() { writePaymentAttempt = previousWriter })
+
+	completedOrder := `{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"CAPLOGGING","status":"COMPLETED","create_time":"2026-11-06T12:00:00Z","amount":{"value":"25.00","currency_code":"USD"}}]}}]}`
+	mockEndpoints(t, `{"status":"APPROVED"}`, completedOrder, "")
+	previousPersist := persistCapture
+	persistCapture = func(context.Context, PaymentRecord) error { return nil }
+	t.Cleanup(func() { persistCapture = previousPersist })
+
+	req := httptest.NewRequest(http.MethodPost, "/api/capture-order", strings.NewReader(`{"orderID":"ORDER123"}`))
+	w := httptest.NewRecorder()
+	makeCaptureOrderHandler("client", "secret").ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("capture response = %d %s, want HTTP 200 despite attempt writer failure", w.Code, w.Body.String())
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-logged:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for best-effort attempt writer")
+		}
 	}
 }
 

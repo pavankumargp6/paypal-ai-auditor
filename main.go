@@ -35,11 +35,25 @@ END)::BIGINT)`
 
 const liveRecordsQuery = `SELECT id, ` + amountMinorFallbackExpression + ` AS amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`
 
+const declineRateQuery = `SELECT COUNT(*) FILTER (WHERE outcome = 'declined'), COUNT(*)
+	FROM attempts WHERE stage = 'capture' AND is_synthetic = FALSE`
+
 var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
 
 type PayPalErrorDetail struct {
 	Issue       string `json:"issue"`
 	Description string `json:"description"`
+}
+
+type PaymentAttempt struct {
+	Stage        string
+	Outcome      string
+	ReasonCode   string
+	ReasonDetail string
+	HTTPStatus   *int
+	AmountMinor  int64
+	Currency     string
+	IsSynthetic  bool
 }
 
 // PayPalAPIError preserves structured response fields without retaining or logging
@@ -129,6 +143,18 @@ var (
 		entries map[[32]byte]*insightCacheEntry
 	}{entries: make(map[[32]byte]*insightCacheEntry)}
 
+	writePaymentAttempt = func(ctx context.Context, targetDB *sql.DB, attempt PaymentAttempt) error {
+		if targetDB == nil {
+			return fmt.Errorf("database unavailable")
+		}
+		_, err := targetDB.ExecContext(ctx, `INSERT INTO attempts
+			(stage, outcome, reason_code, reason_detail, http_status, amount_minor, currency, is_synthetic)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			attempt.Stage, attempt.Outcome, attempt.ReasonCode, attempt.ReasonDetail,
+			attempt.HTTPStatus, attempt.AmountMinor, attempt.Currency, attempt.IsSynthetic)
+		return err
+	}
+
 	persistCapture = func(ctx context.Context, p PaymentRecord) error {
 		args := []any{p.ID, p.AmountMinor, p.Status, p.Currency, p.Date, p.IsLive}
 		if tx, ok := ctx.Value(captureTransactionContextKey{}).(*sql.Tx); ok {
@@ -156,11 +182,12 @@ type insightCacheEntry struct {
 }
 
 type SpendSummary struct {
-	TotalCapturedMinor   int64  `json:"total_captured_minor,string"`
-	LiveSuccess          int    `json:"live_success"`
-	DemoCompletedCount   int    `json:"demo_completed_count"`
-	DeclineRateAvailable bool   `json:"decline_rate_available"`
-	AIInsight            string `json:"ai_insight"`
+	TotalCapturedMinor   int64   `json:"total_captured_minor,string"`
+	LiveSuccess          int     `json:"live_success"`
+	DemoCompletedCount   int     `json:"demo_completed_count"`
+	DeclineRateAvailable bool    `json:"decline_rate_available"`
+	DeclineRatePercent   float64 `json:"decline_rate_percent"`
+	AIInsight            string  `json:"ai_insight"`
 }
 
 func currencyExponent(currency string) int {
@@ -358,6 +385,7 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
+			recordAttemptBestEffort(attemptFromPayPalError("create", expectedAmountMinor, expectedCurrency, err))
 			log.Printf("create-order auth: %v", err)
 			sendJSONError(w, "PayPal auth failed", http.StatusBadGateway)
 			return
@@ -365,16 +393,19 @@ func makeCreateOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		returnURL, cancelURL, err := payPalReturnCancelURLs(os.Getenv("APP_BASE_URL"))
 		if err != nil {
+			recordAttemptBestEffort(PaymentAttempt{Stage: "create", Outcome: "failed", ReasonCode: "APP_BASE_URL_INVALID", ReasonDetail: "PayPal callback URL configuration is invalid", AmountMinor: expectedAmountMinor, Currency: expectedCurrency})
 			log.Printf("create-order callback URL: %v", err)
 			sendJSONError(w, "Invalid APP_BASE_URL", http.StatusInternalServerError)
 			return
 		}
-		orderID, approveURL, err := createPayPalOrder(ctx, token, returnURL, cancelURL)
+		orderID, approveURL, httpStatus, err := createPayPalOrderWithStatus(ctx, token, returnURL, cancelURL)
 		if err != nil {
+			recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("create", expectedAmountMinor, expectedCurrency, httpStatus, err))
 			log.Printf("create-order create: %v", err)
 			sendJSONError(w, "Order creation failed", http.StatusBadGateway)
 			return
 		}
+		recordAttemptBestEffort(successfulAttempt("create", "ORDER_CREATED", "PayPal order created", expectedAmountMinor, expectedCurrency, httpStatus))
 		if approveURL == "" {
 			log.Printf("create-order: missing approval link in PayPal response")
 			sendJSONError(w, "Missing approval link", http.StatusBadGateway)
@@ -411,6 +442,7 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 
 		token, err := getPayPalToken(ctx, clientID, clientSecret)
 		if err != nil {
+			recordAttemptBestEffort(attemptFromPayPalError("approve", expectedAmountMinor, expectedCurrency, err))
 			log.Printf("capture-order auth: %v", err)
 			sendJSONError(w, "PayPal auth failed", http.StatusBadGateway)
 			return
@@ -448,8 +480,9 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 	var persistenceErr error
 
 	runErr := orderLock(ctx, orderID, func(lockCtx context.Context) error {
-		status, err := verifyOrderStatus(lockCtx, token, orderID)
+		status, verifyHTTPStatus, err := verifyOrderStatusWithStatus(lockCtx, token, orderID)
 		if err != nil {
+			recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("approve", expectedAmountMinor, expectedCurrency, verifyHTTPStatus, err))
 			failureStatus = http.StatusBadGateway
 			failureMessage = "Failed to verify order status"
 			return err
@@ -457,27 +490,54 @@ func captureOrderWithLock(ctx context.Context, token, orderID string) (PaymentRe
 
 		switch status {
 		case "COMPLETED":
-			payment, err = reconcileCapture(lockCtx, token, orderID)
+			attempt := successfulAttempt("approve", "ORDER_ALREADY_CAPTURED", "PayPal order was already completed", expectedAmountMinor, expectedCurrency, verifyHTTPStatus)
+			attempt.Outcome = "reconciled"
+			recordAttemptBestEffort(attempt)
+			var reconcileHTTPStatus int
+			var reconcileErr error
+			payment, reconcileHTTPStatus, reconcileErr = reconcileCaptureWithStatus(lockCtx, token, orderID)
+			err = reconcileErr
 			if err != nil {
+				recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
 				failureStatus = http.StatusBadGateway
 				failureMessage = "Reconcile failed"
 				return err
 			}
+			captureAttempt := successfulAttempt("capture", "ORDER_ALREADY_CAPTURED", "Capture reconciled from the completed PayPal order", payment.AmountMinor, payment.Currency, reconcileHTTPStatus)
+			captureAttempt.Outcome = "reconciled"
+			recordAttemptBestEffort(captureAttempt)
 		case "APPROVED":
-			payment, err = capturePayPalOrder(lockCtx, token, orderID)
+			recordAttemptBestEffort(successfulAttempt("approve", "ORDER_APPROVED", "PayPal order is approved", expectedAmountMinor, expectedCurrency, verifyHTTPStatus))
+			var captureHTTPStatus int
+			var captureErr error
+			payment, captureHTTPStatus, captureErr = capturePayPalOrderWithStatus(lockCtx, token, orderID)
+			err = captureErr
 			if errors.Is(err, errOrderAlreadyCaptured) {
-				payment, err = reconcileCapture(lockCtx, token, orderID)
+				captureAttempt := attemptFromPayPalErrorWithStatus("capture", expectedAmountMinor, expectedCurrency, captureHTTPStatus, err)
+				captureAttempt.Outcome = "reconciled"
+				recordAttemptBestEffort(captureAttempt)
+				var reconcileHTTPStatus int
+				var reconcileErr error
+				payment, reconcileHTTPStatus, reconcileErr = reconcileCaptureWithStatus(lockCtx, token, orderID)
+				err = reconcileErr
 				if err != nil {
+					recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("reconcile", expectedAmountMinor, expectedCurrency, reconcileHTTPStatus, err))
 					failureStatus = http.StatusBadGateway
 					failureMessage = "Reconcile failed after PayPal reported an already-captured order"
 					return err
 				}
+				recordAttemptBestEffort(successfulAttempt("reconcile", "CAPTURE_RECONCILED", "PayPal capture reconciled", payment.AmountMinor, payment.Currency, reconcileHTTPStatus))
 			} else if err != nil {
+				recordAttemptBestEffort(attemptFromPayPalErrorWithStatus("capture", expectedAmountMinor, expectedCurrency, captureHTTPStatus, err))
 				failureStatus = http.StatusBadGateway
 				failureMessage = "Capture failed"
 				return err
+			} else {
+				recordAttemptBestEffort(successfulAttempt("capture", "CAPTURE_COMPLETED", "PayPal capture completed", payment.AmountMinor, payment.Currency, captureHTTPStatus))
 			}
 		default:
+			attempt := PaymentAttempt{Stage: "approve", Outcome: "failed", ReasonCode: "ORDER_NOT_APPROVED", ReasonDetail: "PayPal order status is " + status, HTTPStatus: &verifyHTTPStatus, AmountMinor: expectedAmountMinor, Currency: expectedCurrency}
+			recordAttemptBestEffort(attempt)
 			failureStatus = http.StatusBadRequest
 			failureMessage = fmt.Sprintf("Order status is %s. Must be APPROVED.", status)
 			return fmt.Errorf("unexpected order status %q", status)
@@ -534,11 +594,23 @@ func makeSpendHandler(groqKey string) http.HandlerFunc {
 		}
 
 		summary := calculateSummary(liveRecords, getDemoRecords())
+		loadDeclineRate(ctx, &summary)
 		summary.AIInsight = cachedAIInsight(ctx, groqKey, summary)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(summary)
 	}
+}
+
+func loadDeclineRate(ctx context.Context, summary *SpendSummary) {
+	if db == nil {
+		return
+	}
+	var declined, total int64
+	if err := db.QueryRowContext(ctx, declineRateQuery).Scan(&declined, &total); err != nil {
+		return
+	}
+	summary.DeclineRatePercent, summary.DeclineRateAvailable = declineRate(declined, total)
 }
 
 func cachedAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
@@ -686,6 +758,11 @@ func getPayPalToken(ctx context.Context, clientID, secret string) (string, error
 }
 
 func createPayPalOrder(ctx context.Context, token, returnURL string, cancelURLs ...string) (string, string, error) {
+	id, approvalURL, _, err := createPayPalOrderWithStatus(ctx, token, returnURL, cancelURLs...)
+	return id, approvalURL, err
+}
+
+func createPayPalOrderWithStatus(ctx context.Context, token, returnURL string, cancelURLs ...string) (string, string, int, error) {
 	cancelURL := returnURL
 	if len(cancelURLs) != 0 {
 		cancelURL = cancelURLs[0]
@@ -702,29 +779,29 @@ func createPayPalOrder(ctx context.Context, token, returnURL string, cancelURLs 
 	}
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
-		return "", "", fmt.Errorf("marshal order payload: %w", err)
+		return "", "", 0, fmt.Errorf("marshal order payload: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		"https://api-m.sandbox.paypal.com/v2/checkout/orders", bytes.NewReader(jsonPayload))
 	if err != nil {
-		return "", "", fmt.Errorf("build order request: %w", err)
+		return "", "", 0, fmt.Errorf("build order request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("order request: %w", err)
+		return "", "", 0, fmt.Errorf("order request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", fmt.Errorf("read order body: %w", err)
+		return "", "", resp.StatusCode, fmt.Errorf("read order body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", fmt.Errorf("order request: %w", newPayPalAPIError(resp.StatusCode, body))
+		return "", "", resp.StatusCode, fmt.Errorf("order request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 
 	var result struct {
@@ -735,10 +812,10 @@ func createPayPalOrder(ctx context.Context, token, returnURL string, cancelURLs 
 		} `json:"links"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", "", fmt.Errorf("decode order response: %w", err)
+		return "", "", resp.StatusCode, fmt.Errorf("decode order response: %w", err)
 	}
 	if result.ID == "" {
-		return "", "", fmt.Errorf("missing order ID in response")
+		return "", "", resp.StatusCode, fmt.Errorf("missing order ID in response")
 	}
 
 	var approveURL string
@@ -749,43 +826,48 @@ func createPayPalOrder(ctx context.Context, token, returnURL string, cancelURLs 
 		}
 	}
 	if err := validateApprovalURL(approveURL); err != nil {
-		return "", "", fmt.Errorf("invalid approval URL: %w", err)
+		return "", "", resp.StatusCode, fmt.Errorf("invalid approval URL: %w", err)
 	}
-	return result.ID, approveURL, nil
+	return result.ID, approveURL, resp.StatusCode, nil
 }
 
 func verifyOrderStatus(ctx context.Context, token, orderID string) (string, error) {
+	status, _, err := verifyOrderStatusWithStatus(ctx, token, orderID)
+	return status, err
+}
+
+func verifyOrderStatusWithStatus(ctx context.Context, token, orderID string) (string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s", orderID), nil)
 	if err != nil {
-		return "", fmt.Errorf("build verify request: %w", err)
+		return "", 0, fmt.Errorf("build verify request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("verify request: %w", err)
+		return "", 0, fmt.Errorf("verify request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read verify body: %w", err)
+		return "", resp.StatusCode, fmt.Errorf("read verify body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("verify request: %w", newPayPalAPIError(resp.StatusCode, body))
+		return "", resp.StatusCode, fmt.Errorf("verify request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
 
 	var result struct {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("malformed status response: %w", err)
+		return "", resp.StatusCode, fmt.Errorf("malformed status response: %w", err)
 	}
 	if result.Status == "" {
-		return "", fmt.Errorf("empty order status in response")
+		return "", resp.StatusCode, fmt.Errorf("empty order status in response")
 	}
-	return result.Status, nil
+	return result.Status, resp.StatusCode, nil
 }
 
 func captureRequestID(orderID string) string {
@@ -793,10 +875,15 @@ func captureRequestID(orderID string) string {
 }
 
 func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentRecord, error) {
+	payment, _, err := capturePayPalOrderWithStatus(ctx, token, orderID)
+	return payment, err
+}
+
+func capturePayPalOrderWithStatus(ctx context.Context, token, orderID string) (PaymentRecord, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s/capture", orderID), nil)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("build capture request: %w", err)
+		return PaymentRecord{}, 0, fmt.Errorf("build capture request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -804,46 +891,53 @@ func capturePayPalOrder(ctx context.Context, token, orderID string) (PaymentReco
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("capture request: %w", err)
+		return PaymentRecord{}, 0, fmt.Errorf("capture request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("read capture body: %w", err)
+		return PaymentRecord{}, resp.StatusCode, fmt.Errorf("read capture body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		apiErr := newPayPalAPIError(resp.StatusCode, body)
 		if apiErr.ReasonCode == "ORDER_ALREADY_CAPTURED" {
-			return PaymentRecord{}, fmt.Errorf("%w: %w", errOrderAlreadyCaptured, apiErr)
+			return PaymentRecord{}, resp.StatusCode, fmt.Errorf("%w: %w", errOrderAlreadyCaptured, apiErr)
 		}
-		return PaymentRecord{}, fmt.Errorf("capture request: %w", apiErr)
+		return PaymentRecord{}, resp.StatusCode, fmt.Errorf("capture request: %w", apiErr)
 	}
-	return parseCaptureFromBody(body)
+	payment, err := parseCaptureFromBody(body)
+	return payment, resp.StatusCode, err
 }
 
 func reconcileCapture(ctx context.Context, token, orderID string) (PaymentRecord, error) {
+	payment, _, err := reconcileCaptureWithStatus(ctx, token, orderID)
+	return payment, err
+}
+
+func reconcileCaptureWithStatus(ctx context.Context, token, orderID string) (PaymentRecord, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET",
 		fmt.Sprintf("https://api-m.sandbox.paypal.com/v2/checkout/orders/%s", orderID), nil)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("build reconcile request: %w", err)
+		return PaymentRecord{}, 0, fmt.Errorf("build reconcile request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("reconcile request: %w", err)
+		return PaymentRecord{}, 0, fmt.Errorf("reconcile request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return PaymentRecord{}, fmt.Errorf("read reconcile body: %w", err)
+		return PaymentRecord{}, resp.StatusCode, fmt.Errorf("read reconcile body: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return PaymentRecord{}, fmt.Errorf("reconcile request: %w", newPayPalAPIError(resp.StatusCode, body))
+		return PaymentRecord{}, resp.StatusCode, fmt.Errorf("reconcile request: %w", newPayPalAPIError(resp.StatusCode, body))
 	}
-	return parseCaptureFromBody(body)
+	payment, err := parseCaptureFromBody(body)
+	return payment, resp.StatusCode, err
 }
 
 func parseCaptureFromBody(body []byte) (PaymentRecord, error) {
@@ -930,8 +1024,79 @@ func calculateSummary(live, demo []PaymentRecord) SpendSummary {
 	return SpendSummary{TotalCapturedMinor: liveTotal, LiveSuccess: liveSuccess, DemoCompletedCount: demoCompleted, DeclineRateAvailable: false}
 }
 
+func recordAttemptBestEffort(attempt PaymentAttempt) {
+	targetDB := db
+	writer := writePaymentAttempt
+	if targetDB == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := writer(ctx, targetDB, attempt); err != nil {
+			log.Printf("payment attempt logging failed stage=%s outcome=%s", attempt.Stage, attempt.Outcome)
+		}
+	}()
+}
+
+func attemptFromPayPalError(stage string, amountMinor int64, currency string, err error) PaymentAttempt {
+	attempt := PaymentAttempt{
+		Stage:        stage,
+		Outcome:      "failed",
+		ReasonCode:   "UNCLASSIFIED",
+		ReasonDetail: "PayPal request failed without structured error details",
+		AmountMinor:  amountMinor,
+		Currency:     currency,
+	}
+	var apiErr *PayPalAPIError
+	if !errors.As(err, &apiErr) {
+		return attempt
+	}
+	attempt.ReasonCode = apiErr.ReasonCode
+	attempt.ReasonDetail = apiErr.ReasonDetail
+	attempt.HTTPStatus = &apiErr.HTTPStatus
+	switch strings.ToUpper(apiErr.ReasonCode) {
+	case "INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY", "PAYMENT_DENIED":
+		attempt.Outcome = "declined"
+	case "ORDER_ALREADY_CAPTURED":
+		attempt.Outcome = "reconciled"
+	}
+	return attempt
+}
+
+func attemptFromPayPalErrorWithStatus(stage string, amountMinor int64, currency string, status int, err error) PaymentAttempt {
+	attempt := attemptFromPayPalError(stage, amountMinor, currency, err)
+	if attempt.HTTPStatus == nil && status > 0 {
+		attempt.HTTPStatus = &status
+	}
+	return attempt
+}
+
+func successfulAttempt(stage, reason, detail string, amountMinor int64, currency string, status int) PaymentAttempt {
+	return PaymentAttempt{
+		Stage:        stage,
+		Outcome:      "succeeded",
+		ReasonCode:   reason,
+		ReasonDetail: detail,
+		HTTPStatus:   &status,
+		AmountMinor:  amountMinor,
+		Currency:     currency,
+	}
+}
+
+func declineRate(declined, total int64) (float64, bool) {
+	if total <= 0 {
+		return 0, false
+	}
+	return float64(declined) * 100 / float64(total), true
+}
+
 func generateAIInsight(ctx context.Context, apiKey string, summary SpendSummary) string {
-	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%s (%d payments), Demo %d. Decline rate NOT TRACKED. Give 1-sentence actionable insight. Max 20 words.`, formatMinorUnits(summary.TotalCapturedMinor, expectedCurrency), summary.LiveSuccess, summary.DemoCompletedCount)
+	declineRateText := "no data yet"
+	if summary.DeclineRateAvailable {
+		declineRateText = fmt.Sprintf("%.1f%%", summary.DeclineRatePercent)
+	}
+	prompt := fmt.Sprintf(`You are a merchant AI copilot. Analyze: Live Revenue $%s (%d payments), Demo %d. Decline rate %s. Give 1-sentence actionable insight. Max 20 words.`, formatMinorUnits(summary.TotalCapturedMinor, expectedCurrency), summary.LiveSuccess, summary.DemoCompletedCount, declineRateText)
 
 	payload := map[string]interface{}{
 		"model":       "openai/gpt-oss-20b",
