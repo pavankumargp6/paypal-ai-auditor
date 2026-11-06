@@ -29,6 +29,12 @@ Required variables:
 - **Reconciliation:** If an order is already `COMPLETED`, the backend safely reconciles instead of failing.
 - **Persistence Failures:** If PayPal succeeds but DB insert fails, the API returns `capture_succeeded_persistence_pending`.
 
+## Findings and Actions
+- Deterministic Go detectors create `duplicate_capture` and `fee_mismatch` findings; Groq does not decide leak status or amounts. Groq is limited to plain-English insight/explanation text.
+- Duplicate-capture evidence includes the capture IDs. Fee evidence records expected fee, PayPal's reported `seller_receivable_breakdown.paypal_fee`, and the delta in minor units ([PayPal webhook payload](https://developer.paypal.com/api/rest/webhooks/rest/)). The fee detector applies the requested `round(amount_minor * 0.029) + 30` heuristic and flags differences greater than one minor unit; this is a heuristic, not PayPal's full merchant-specific fee schedule.
+- Leakage score SQL groups open findings as lost, open/acknowledged findings as recoverable, and actioned findings as recovered. Here, “recovered” follows the requested actioned status mapping; it is not proof that funds were returned.
+- Approving an action records an executed status and audit events in JSONB; `money_moved` remains false. No action endpoint moves funds.
+
 ## Limitations
 - **Sandbox only:** Payments use PayPal Sandbox; do not use this app for live transactions.
 - **No authentication:** API endpoints do not authenticate users and must not be exposed as a production merchant system.

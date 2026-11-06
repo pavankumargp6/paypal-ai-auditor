@@ -35,11 +35,15 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 
 ## In progress / next step
 
-- The concurrent duplicate-delivery test is green in CI run #42237267272. Stop here before the agent loop.
-- At the previous pushed revision, `HEAD` and the remote ref matched at `9da3f2afa8942546b6194e59ca0051998ab50eed`. GitHub Actions run [#42235597732](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42235597732) passed after applying migrations 001–003. The workflow sets `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`, so the five PostgreSQL integration tests in that revision ran rather than skipped. The new concurrent duplicate-delivery test awaits CI.
+- Migration 004, deterministic detectors, leakage score SQL, and record-only action endpoints are implemented locally. Local vet/race tests pass; the seven PostgreSQL integration tests skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset. CI now applies migration 004 before running them.
+- Migration 004 is additive and idempotent. It creates `findings` and `actions`, both with `BIGSERIAL` IDs, JSONB evidence/result, the requested status checks, and indexes. It has not been run against Render. Show `migrations/004_findings_actions.sql` and get explicit approval before running `go run ./cmd/migrate ./migrations/004_findings_actions.sql` against Render.
+- The Go detectors are independent of Groq: duplicate capture evidence cites capture IDs; fee mismatch evidence cites expected and actual fee minor units and flags deltas greater than one minor unit. The fee estimate is the requested 2.9% plus 30 minor units heuristic, not PayPal's full merchant-specific fee schedule. `POST /api/findings/detect` runs them; findings can be read with `GET /api/findings`.
+- Action routes are `POST /api/findings/{id}/action` and `POST /api/actions/{id}/approve`. Approval records `proposed` → `approved` → `executed` audit events in the JSONB result and changes the finding to `actioned`; `money_moved` is always false, and no PayPal money operation is called. The requested “recovered” score bucket maps to `actioned`, not proof of funds returned.
+- Next: review the SQL below, commit/push the implementation, verify the Postgres-backed integration tests in CI, then wait for approval before applying 004 to Render. Do not start the agent loop until requested.
+- Historical CI run [#42235597732](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42235597732) passed after applying migrations 001–003. The concurrent duplicate-delivery test was subsequently confirmed green in run #42237267272.
 - Migration 003 was revised with additive `resource_id`, `processed_at`, and `process_error` columns plus a `resource_id` index. The approved command was `go run ./cmd/migrate ./migrations/003_webhook_events.sql`; it was applied to the user's Render database. The runner reported 0 rows and 0 minor units before and after. Read-only schema inspection showed `event_id`, `event_type`, `resource_id`, `payload`, `received_at`, `processed_at`, and `process_error`; `schema_migrations` contains 001, 002, and 003.
 - Decline rate now uses only `INSTRUMENT_DECLINED`, `PAYER_CANNOT_PAY`, and `PAYMENT_DENIED` as numerator codes, among real capture-stage attempts. README states these codes come from sandbox negative testing, defines recoverable as retrying with another funding source without guaranteeing recovery, and warns that webhook payloads may contain payer data (sandbox only).
-- Current local checks: `go vet ./...` passed; `go test -race -count=1 -v ./...` passed unit tests. All six PostgreSQL tests, including the new concurrency test, skipped because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
+- Current local checks for findings/actions: `go vet ./...` passed; `go test -race -count=1 -v ./...` passed. All seven PostgreSQL integration tests skipped because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
 - Phase 1.0 migration was approved and applied once to the user's Render Postgres database on 2026-11-06. The runner now executes the migration and records `schema_migrations` in one transaction, redacts `DATABASE_URL` from errors, and checks/reports row counts and total minor units before and after.
 - Post-migration read verification: the locally started app on port 18080 returned HTTP 200 from `/api/transactions` with 10 rows and HTTP 200 plus valid JSON from `/api/spend-intelligence`. No capture endpoint was called. Port 8080 rejected an earlier bind attempt; a later listener check found no process bound to it, so the earlier owner could not be identified. Nothing was stopped or killed.
 - Current local checks: `gofmt -l .` returned no files, `go vet ./...` exited 0, and `go test -race -count=1 ./...` passed with `ok paypal-ai-auditor 2.552s`; `cmd/migrate` compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally; in CI, a missing URL is now fatal.
@@ -55,6 +59,8 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 - PostgreSQL integration tests use only `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`, never `DATABASE_URL`, so local test runs do not accidentally target Render. GitHub Actions now supplies a PostgreSQL service and that dedicated URL.
 - PayPal return/cancel URLs are built from `APP_BASE_URL` (default `http://localhost:8080`). Groq insights are cached in memory for 60 seconds by the complete summary payload, including a per-key in-flight request guard; the cache is bounded to 128 summaries. Capture rows use PayPal `create_time`, falling back to `update_time`.
 - Payment attempt writes run asynchronously through a separate pooled database operation and only log a fixed failure message if insertion fails; they do not share or abort the capture advisory-lock transaction. The decline rate counts capture-stage, non-synthetic attempts; known sandbox decline issues increment the numerator. Until migration 002 is applied, the dashboard shows “No data yet” and attempt inserts fail best-effort without breaking payment flow.
+- Findings are generated only by deterministic Go code from non-synthetic attempts and PayPal's completed-capture fee data. Findings are idempotent by a stable SHA-256 fingerprint; rescans refresh evidence only while status remains open, preserving acknowledged/actioned/dismissed states. Fee estimate is stored in minor units without float arithmetic.
+- An action's `executed` state means record-only approval in this app. Audit events say `money_moved: false`; score's `recovered_minor` is the specified sum of `actioned` findings and must not be represented as a confirmed PayPal refund.
 - `psql` is not installed in the current environment. `cmd/migrate` is a one-shot Go runner using existing PostgreSQL and dotenv dependencies. It creates `schema_migrations` if needed, then executes the migration, verifies/reports totals, and records the migration filename in one transaction. A rerun after a successful record skips it; an interrupted unrecorded migration can safely be retried because the SQL is idempotent.
 - The legacy `amount` column remains `NOT NULL`; new capture inserts keep it populated from minor units in SQL for compatibility. Reads, validation, totals, API output, and frontend formatting use minor units.
 
@@ -63,10 +69,11 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 - Historical note: migration 001 was previously applied to the former database, which the user has since deleted; that run reported 7 rows and 17,500 minor units before and after. Current replacement-database results are recorded below.
 - On the replacement empty database, read-only inspection confirmed `captures.amount_minor` exists and `captures` had 0 rows; `schema_migrations` initially contained only migration 001. Migrations 001, 002, and approved 003 were applied with `cmd/migrate`; each reported 0 rows and 0 minor units before and after. Attempts columns were verified after 002; webhook columns were verified after 003. No credentials were printed.
 - Historical CI run [#42221126619](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42221126619) passed with migrations 001–003 applied to disposable PostgreSQL. The updated webhook retry integration test is pending a new CI run.
-- The dedicated PostgreSQL test URL is unset locally, so all five database integration tests skip locally. The new webhook retry integration test must be confirmed in CI after this branch push.
+- The dedicated PostgreSQL test URL is unset locally, so all seven PostgreSQL integration tests skip locally. Migration 004 and `TestPostgresDetectorsAndActionAudit` await CI verification after this task's push.
 - The transaction-aware retry path is covered locally with mocked PayPal and a simulated persistence failure. The env-gated integration test exercises it with a real PostgreSQL advisory-lock transaction and mocked PayPal when the dedicated test DB is available.
 - Local app verification on port 18080 against the replacement database passed: `/api/spend-intelligence` returned HTTP 200, `total_captured_minor=0`, `decline_rate_available=false`, and `ai_insight=Not enough data yet`; `/` returned HTTP 200 and the page contains the “No data yet” decline fallback, Source labels, and citation rendering. No PayPal capture was triggered. The app process was stopped after the check.
 - Webhook handling stores payloads that may contain payer data; do not log payloads and use this endpoint for Sandbox only. Supported capture events write webhook-stage attempts; unknown event types are persisted and marked processed without an attempt.
+- Migration 004 has not been applied to Render. Until then, findings and actions routes return database errors on that database; CI applies it to its disposable PostgreSQL service.
 - PayPal negative-test mock responses are not actual buyer/card decline transactions. `INSUFFICIENT_FUNDS` classification remains unverified.
 - The app has no authentication. Live payments are out of scope; use only PayPal Sandbox credentials. The Groq diagnostic probe returned HTTP 401 with error code `invalid_api_key`; the key and response body were not printed. Groq lists `openai/gpt-oss-20b` as a supported production model in its current model docs: https://console.groq.com/docs/models and https://console.groq.com/docs/model/openai/gpt-oss-20b.
 - Before finalizing decline labels, verify from PayPal docs that `buyer_recoverable` means the buyer can retry with another funding source; do not imply recovery is guaranteed. Seeded failures must be labeled simulated.
@@ -78,7 +85,7 @@ Tests and static checks:
 ```powershell
 $goExe = 'C:\Program Files\Go\bin\go.exe'
 $gofmtExe = 'C:\Program Files\Go\bin\gofmt.exe'
-& $gofmtExe -w main.go webhook.go main_test.go main_integration_test.go
+& $gofmtExe -w main.go webhook.go actions.go detectors.go main_test.go main_integration_test.go
 & $goExe version
 & $goExe vet ./...
 & $goExe test -race -count=1 -v ./...
@@ -97,10 +104,10 @@ $env:PAYPAL_AI_AUDITOR_TEST_DATABASE_URL = 'postgres://test:test@localhost:5432/
 & 'C:\Program Files\Go\bin\go.exe' test -race -count=1 ./...
 ```
 
-`psql` is not available here. The approved migrations have already been applied. The most recent invocation was:
+`psql` is not available here. Migrations 001–003 have already been applied. Migration 004 has not been applied to Render; the command for after explicit approval is:
 
 ```powershell
-& 'C:\Program Files\Go\bin\go.exe' run ./cmd/migrate ./migrations/003_webhook_events.sql
+& 'C:\Program Files\Go\bin\go.exe' run ./cmd/migrate ./migrations/004_findings_actions.sql
 ```
 
-The user approved and migrations 001–003 have already been run. `cmd/migrate` reads `DATABASE_URL` without printing its value; it creates `schema_migrations` if needed, and applies the migration plus tracking record in the same transaction. Do not rerun them as part of this handoff unless the user requests it.
+`cmd/migrate` reads `DATABASE_URL` without printing its value; it creates `schema_migrations` if needed, and applies the migration plus tracking record in the same transaction. Do not run migration 004 against Render before explicit approval.

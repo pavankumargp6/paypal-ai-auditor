@@ -206,6 +206,18 @@ func currencyExponent(currency string) int {
 	}
 }
 
+func validCurrency(currency string) bool {
+	if len(currency) != 3 {
+		return false
+	}
+	for _, r := range currency {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
 func parseMinorUnits(value, currency string) (int64, error) {
 	exponent := currencyExponent(currency)
 	wholePart, fractionalPart, hasDecimal := strings.Cut(value, ".")
@@ -348,6 +360,11 @@ func main() {
 	mux.HandleFunc("/api/capture-order", makeCaptureOrderHandler(clientID, clientSecret))
 	mux.HandleFunc("/api/spend-intelligence", makeSpendHandler(groqKey))
 	mux.HandleFunc("/api/transactions", makeTransactionsHandler())
+	mux.HandleFunc("/api/findings", makeFindingsHandler())
+	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler())
+	mux.HandleFunc("/api/findings/", makeFindingActionHandler())
+	mux.HandleFunc("/api/actions/", makeApproveActionHandler())
+	mux.HandleFunc("/api/leakage-score", makeLeakageScoreHandler())
 	webhookID := strings.TrimSpace(os.Getenv("PAYPAL_WEBHOOK_ID"))
 	mux.HandleFunc("/webhooks/paypal", makePayPalWebhookHandler(clientID, clientSecret, webhookID))
 

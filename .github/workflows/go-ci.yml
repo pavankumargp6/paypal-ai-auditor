@@ -58,6 +58,7 @@ jobs:
           go run ./cmd/migrate ./migrations/001_amount_minor.sql
           go run ./cmd/migrate ./migrations/002_attempts.sql
           go run ./cmd/migrate ./migrations/003_webhook_events.sql
+          go run ./cmd/migrate ./migrations/004_findings_actions.sql
 
       - name: Verify gofmt
         run: |

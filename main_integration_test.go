@@ -321,6 +321,107 @@ func TestPostgresConcurrentDuplicateWebhookPostsWriteOneAttempt(t *testing.T) {
 	}
 }
 
+func TestPostgresDetectorsAndActionAudit(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	orderID := "DETECT-ORDER-" + suffix
+	capture1, capture2, repeatedID := "DETECT-CAP-A-"+suffix, "DETECT-CAP-B-"+suffix, "DETECT-CAP-X-"+suffix
+	eventID := "DETECT-EVENT-" + suffix
+	fingerprint := "action-test-" + suffix
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	t.Cleanup(func() {
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM actions WHERE finding_id IN (SELECT id FROM findings WHERE fingerprint = $1)`, fingerprint)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM findings WHERE fingerprint = $1 OR fingerprint IN ($2, $3, $4)`,
+			fingerprint, "duplicate_capture:order:"+fingerprintToken(orderID), "duplicate_capture:capture:"+fingerprintToken(repeatedID), "fee_mismatch:"+fingerprintToken(capture1))
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM attempts WHERE capture_id IN ($1, $2, $3)`, capture1, capture2, repeatedID)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+	})
+
+	for _, row := range []struct {
+		orderID, captureID, outcome, stage string
+	}{
+		{orderID, capture1, "succeeded", "capture"},
+		{orderID, capture2, "succeeded", "capture"},
+		{"DETECT-REPEATED-" + suffix, repeatedID, "failed", "capture"},
+		{"DETECT-REPEATED-" + suffix, repeatedID, "succeeded", "webhook"},
+	} {
+		if _, err := testDB.ExecContext(ctx, `INSERT INTO attempts
+			(paypal_order_id, capture_id, stage, outcome, amount_minor, currency, is_synthetic)
+			VALUES ($1, $2, $3, $4, 2500, 'USD', FALSE)`, row.orderID, row.captureID, row.stage, row.outcome); err != nil {
+			t.Fatalf("insert detector attempt fixture: %v", err)
+		}
+	}
+	payload := fmt.Sprintf(`{"id":%q,"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":%q,"amount":{"value":"25.00","currency_code":"USD"},"seller_receivable_breakdown":{"paypal_fee":{"currency_code":"USD","value":"1.05"}}}}`, eventID, capture1)
+	if _, err := testDB.ExecContext(ctx, `INSERT INTO webhook_events (event_id, event_type, resource_id, payload, processed_at)
+		VALUES ($1, 'PAYMENT.CAPTURE.COMPLETED', $2, $3::jsonb, NOW())`, eventID, capture1, payload); err != nil {
+		t.Fatalf("insert fee evidence fixture: %v", err)
+	}
+	drafts, err := runDeterministicDetectors(ctx, testDB)
+	if err != nil {
+		t.Fatalf("run deterministic detectors: %v", err)
+	}
+	for _, key := range []string{
+		"duplicate_capture:order:" + fingerprintToken(orderID),
+		"duplicate_capture:capture:" + fingerprintToken(repeatedID),
+		"fee_mismatch:" + fingerprintToken(capture1),
+	} {
+		var id int64
+		if err := testDB.QueryRowContext(ctx, `SELECT id FROM findings WHERE fingerprint = $1`, key).Scan(&id); err != nil {
+			t.Fatalf("detector did not persist finding %s (drafts=%d): %v", key, len(drafts), err)
+		}
+	}
+	var baseline leakageScore
+	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&baseline.LostMinor, &baseline.RecoverableMinor, &baseline.RecoveredMinor); err != nil {
+		t.Fatalf("read baseline leakage score: %v", err)
+	}
+	var findingID int64
+	if err := testDB.QueryRowContext(ctx, `INSERT INTO findings (fingerprint, detector, amount_minor, currency, evidence)
+		VALUES ($1, 'fee_mismatch', 200, 'USD', '{}'::jsonb) RETURNING id`, fingerprint).Scan(&findingID); err != nil {
+		t.Fatalf("insert action finding: %v", err)
+	}
+	proposal := httptest.NewRecorder()
+	proposalReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/findings/%d/action", findingID), strings.NewReader(`{"action_type":"record_recovery","description":"Record operator-confirmed recovery"}`))
+	makeFindingActionHandler().ServeHTTP(proposal, proposalReq)
+	if proposal.Code != http.StatusCreated {
+		t.Fatalf("propose action response=%d %s, want 201", proposal.Code, proposal.Body.String())
+	}
+	var proposed actionResponse
+	if err := json.Unmarshal(proposal.Body.Bytes(), &proposed); err != nil {
+		t.Fatalf("decode proposed action: %v", err)
+	}
+	if proposed.Status != "proposed" || proposed.MoneyMoved || proposed.FindingID != findingID {
+		t.Fatalf("proposal response = %+v", proposed)
+	}
+	approval := httptest.NewRecorder()
+	approvalReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", proposed.ID), nil)
+	makeApproveActionHandler().ServeHTTP(approval, approvalReq)
+	if approval.Code != http.StatusOK {
+		t.Fatalf("approve action response=%d %s, want 200", approval.Code, approval.Body.String())
+	}
+	var executed actionResponse
+	if err := json.Unmarshal(approval.Body.Bytes(), &executed); err != nil {
+		t.Fatalf("decode executed action: %v", err)
+	}
+	if executed.Status != "executed" || executed.MoneyMoved || !strings.Contains(string(executed.Result), `"money_moved": false`) {
+		t.Fatalf("executed action response = %+v", executed)
+	}
+	var findingStatus string
+	if err := testDB.QueryRowContext(ctx, `SELECT status FROM findings WHERE id = $1`, findingID).Scan(&findingStatus); err != nil {
+		t.Fatalf("read actioned finding: %v", err)
+	}
+	if findingStatus != "actioned" {
+		t.Fatalf("finding status=%q, want actioned", findingStatus)
+	}
+	var after leakageScore
+	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&after.LostMinor, &after.RecoverableMinor, &after.RecoveredMinor); err != nil {
+		t.Fatalf("read final leakage score: %v", err)
+	}
+	if after.LostMinor != baseline.LostMinor || after.RecoverableMinor != baseline.RecoverableMinor || after.RecoveredMinor != baseline.RecoveredMinor+200 {
+		t.Fatalf("leakage score before=%+v after=%+v; expected 200 minor units to move from open to actioned", baseline, after)
+	}
+}
+
 func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {
 	testDB := usePostgresIntegrationDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

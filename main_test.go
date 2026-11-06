@@ -740,6 +740,121 @@ func TestDeclineReasonDefinition(t *testing.T) {
 	}
 }
 
+func TestDuplicateCaptureDetectorUsesCaptureEvidence(t *testing.T) {
+	observations := []captureObservation{
+		{OrderID: "ORDER-1", CaptureID: "CAP-1", AmountMinor: 2500, Currency: "USD", Outcome: "succeeded", Stage: "capture"},
+		{OrderID: "ORDER-1", CaptureID: "CAP-2", AmountMinor: 2500, Currency: "USD", Outcome: "succeeded", Stage: "webhook"},
+		{OrderID: "ORDER-2", CaptureID: "CAP-3", AmountMinor: 4000, Currency: "USD", Outcome: "failed", Stage: "capture"},
+		{OrderID: "ORDER-2", CaptureID: "CAP-3", AmountMinor: 4000, Currency: "USD", Outcome: "succeeded", Stage: "webhook"},
+	}
+	findings := detectDuplicateCaptures(observations)
+	if len(findings) != 2 {
+		t.Fatalf("duplicate findings = %d, want order duplicate and repeated capture ID", len(findings))
+	}
+	var sawOrder, sawID bool
+	for _, finding := range findings {
+		if finding.Detector != "duplicate_capture" {
+			t.Fatalf("detector = %q, want duplicate_capture", finding.Detector)
+		}
+		encoded, err := json.Marshal(finding.Evidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case strings.Contains(finding.Fingerprint, "duplicate_capture:order:"):
+			sawOrder = true
+			if finding.AmountMinor != 2500 || !strings.Contains(string(encoded), `"CAP-1"`) || !strings.Contains(string(encoded), `"CAP-2"`) {
+				t.Fatalf("order duplicate amount/evidence = %d/%s", finding.AmountMinor, encoded)
+			}
+		case strings.Contains(finding.Fingerprint, "duplicate_capture:capture:"):
+			sawID = true
+			if finding.AmountMinor != 0 || !strings.Contains(string(encoded), `"CAP-3"`) {
+				t.Fatalf("repeated capture ID evidence = %d/%s", finding.AmountMinor, encoded)
+			}
+		}
+	}
+	if !sawOrder || !sawID {
+		t.Fatalf("missing detector evidence: order=%v captureID=%v", sawOrder, sawID)
+	}
+}
+
+func TestFeeMismatchDetectorUsesMinorUnitRoundingAndEvidence(t *testing.T) {
+	expected, delta, mismatch := detectFeeMismatch(2500, 103, "USD")
+	if expected != 103 || delta != 0 || mismatch {
+		t.Fatalf("$25 expected fee = %d delta=%d mismatch=%v, want 103/0/false", expected, delta, mismatch)
+	}
+	_, delta, mismatch = detectFeeMismatch(2500, 104, "USD")
+	if delta != 1 || mismatch {
+		t.Fatalf("one-cent delta = %d mismatch=%v, want 1/false", delta, mismatch)
+	}
+	_, delta, mismatch = detectFeeMismatch(2500, 105, "USD")
+	if delta != 2 || !mismatch {
+		t.Fatalf("two-cent delta = %d mismatch=%v, want 2/true", delta, mismatch)
+	}
+	finding, ok := feeMismatchFinding("ORDER-FEE", "CAP-FEE", "USD", 2500, 105)
+	if !ok || finding.Detector != "fee_mismatch" || finding.AmountMinor != 2 {
+		t.Fatalf("fee finding = %+v, ok=%v", finding, ok)
+	}
+	evidence, err := json.Marshal(finding.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{`"capture_id":"CAP-FEE"`, `"expected_fee_minor":103`, `"actual_fee_minor":105`, `"delta_minor":2`} {
+		if !strings.Contains(string(evidence), fragment) {
+			t.Errorf("fee evidence %s missing %s", evidence, fragment)
+		}
+	}
+}
+
+func TestLeakageScoreQueryUsesRequiredStatuses(t *testing.T) {
+	for _, fragment := range []string{
+		"status = 'open'",
+		"status IN ('open', 'acknowledged')",
+		"status = 'actioned'",
+		"SUM(amount_minor)",
+	} {
+		if !strings.Contains(leakageScoreQuery, fragment) {
+			t.Errorf("leakage score query missing %q", fragment)
+		}
+	}
+}
+
+func TestFindingsActionsMigrationIsAdditiveAndHasStatusChecks(t *testing.T) {
+	contents, err := os.ReadFile("migrations/004_findings_actions.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.ToLower(string(contents))
+	for _, fragment := range []string{
+		"create table if not exists findings",
+		"id bigserial primary key",
+		"evidence jsonb not null",
+		"findings_status_check",
+		"('open', 'acknowledged', 'actioned', 'dismissed')",
+		"create table if not exists actions",
+		"result jsonb not null",
+		"actions_status_check",
+		"('proposed', 'approved', 'executed', 'failed', 'rejected')",
+	} {
+		if !strings.Contains(sqlText, fragment) {
+			t.Errorf("migration 004 missing %q", fragment)
+		}
+	}
+	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "alter table") {
+		t.Fatal("migration 004 must be additive")
+	}
+}
+
+func TestCIRunsFindingsActionsMigration(t *testing.T) {
+	contents, err := os.ReadFile(".github/workflows/go-ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), "go run ./cmd/migrate ./migrations/004_findings_actions.sql") {
+		t.Fatal("CI workflow must apply migration 004 before PostgreSQL integration tests")
+	}
+}
+
 func TestWebhookCaptureEventsBecomeAttempts(t *testing.T) {
 	tests := []struct {
 		eventType string
