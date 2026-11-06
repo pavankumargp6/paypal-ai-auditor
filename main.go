@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bytes"
@@ -369,7 +369,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("ðŸš€ Server starting on port %s", port)
+	log.Printf("🚀 Server starting on port %s", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -451,16 +451,11 @@ func makeCaptureOrderHandler(clientID, clientSecret string) http.HandlerFunc {
 		var reqBody struct {
 			OrderID string `json:"orderID"`
 		}
-		    var req struct {
-        ActionType string json:"action_type"
-        Actor      string json:"actor"
-    }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, {"error":"Invalid JSON body"}, http.StatusBadRequest)
-        return
-    }
-    if req.ActionType == "" { req.ActionType = "flag_refund" }
-    if req.Actor == "" { req.Actor = "Admin" }
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			log.Printf("capture-order decode: %v", err)
+			sendJSONError(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
 		if !orderIDRegex.MatchString(reqBody.OrderID) {
 			log.Printf("capture-order: invalid order ID format")
 			sendJSONError(w, "Invalid order ID format", http.StatusBadRequest)
@@ -1107,4 +1102,3 @@ func sendJSONError(w http.ResponseWriter, msg string, code int) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
-
