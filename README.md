@@ -34,7 +34,9 @@ Required variables:
 - **No authentication:** API endpoints do not authenticate users and must not be exposed as a production merchant system.
 - **Sandbox reason codes:** Reason codes come from sandbox negative testing and do not establish production decline behavior.
 - **Synthetic data:** Synthetic records are labeled in the UI and excluded from live metrics.
-- **Decline Rate:** A true decline rate requires persisted payment attempts; it is not available until the attempts table is installed.
+- **Decline definition:** Only `INSTRUMENT_DECLINED`, `PAYER_CANNOT_PAY`, and `PAYMENT_DENIED` count as declines. These reason codes come from sandbox negative testing. PayPal's [payment failure guide](https://developer.paypal.com/api/handle-payment-failures/) suggests trying a different payment method for these conditions. “Recoverable” means the buyer can retry with another funding source; it does not guarantee recovery.
+- **Webhook data:** Stored webhook payloads may contain payer data. This application is sandbox only; do not send production payer payloads to it.
+- **Decline Rate:** The rate counts only the three decline codes above in real (non-synthetic) capture attempts; reconciles and other failure codes are excluded. It is unavailable until capture attempts exist.
 
 ## Testing
 Run the unit tests (which mock HTTP and do not hit real PayPal):

@@ -34,12 +34,12 @@ END)::BIGINT)`
 
 const liveRecordsQuery = `SELECT id, ` + amountMinorFallbackExpression + ` AS amount_minor, status, currency, date, is_live FROM captures ORDER BY date DESC`
 
-const declineRateQuery = `SELECT COUNT(*) FILTER (WHERE outcome = 'declined'), COUNT(*)
+const declineRateQuery = `SELECT COUNT(*) FILTER (WHERE reason_code IN ('INSTRUMENT_DECLINED', 'PAYER_CANNOT_PAY', 'PAYMENT_DENIED')), COUNT(*)
 	FROM attempts
 	WHERE stage = 'capture'
 	  AND is_synthetic = FALSE
 	  AND outcome IN ('succeeded', 'declined', 'failed')
-	  AND COALESCE(reason_code, '') <> 'ORDER_ALREADY_CAPTURED'`
+	  AND reason_code IS DISTINCT FROM 'ORDER_ALREADY_CAPTURED'`
 
 var errOrderAlreadyCaptured = errors.New("PayPal reports this order was already captured")
 
@@ -1014,13 +1014,21 @@ func attemptFromPayPalError(stage string, amountMinor int64, currency string, er
 	attempt.ReasonDetail = apiErr.ReasonDetail
 	attempt.DebugID = apiErr.DebugID
 	attempt.HTTPStatus = &apiErr.HTTPStatus
-	switch strings.ToUpper(apiErr.ReasonCode) {
-	case "INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY", "PAYMENT_DENIED":
+	if isDeclineReasonCode(apiErr.ReasonCode) {
 		attempt.Outcome = "declined"
-	case "ORDER_ALREADY_CAPTURED":
+	} else if strings.EqualFold(apiErr.ReasonCode, "ORDER_ALREADY_CAPTURED") {
 		attempt.Outcome = "reconciled"
 	}
 	return attempt
+}
+
+func isDeclineReasonCode(reasonCode string) bool {
+	switch strings.ToUpper(strings.TrimSpace(reasonCode)) {
+	case "INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY", "PAYMENT_DENIED":
+		return true
+	default:
+		return false
+	}
 }
 
 func attemptFromPayPalErrorWithStatus(stage string, amountMinor int64, currency string, status int, err error) PaymentAttempt {

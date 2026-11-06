@@ -722,8 +722,47 @@ func TestDeclineRateNoDataAndCalculation(t *testing.T) {
 	if rate, available := declineRate(2, 5); !available || rate != 40 {
 		t.Fatalf("decline rate = %v/%v, want 40%% available", rate, available)
 	}
-	if !strings.Contains(declineRateQuery, "stage = 'capture'") || !strings.Contains(declineRateQuery, "is_synthetic = FALSE") || !strings.Contains(declineRateQuery, "outcome = 'declined'") || !strings.Contains(declineRateQuery, "ORDER_ALREADY_CAPTURED") || strings.Contains(declineRateQuery, "stage = 'reconcile'") {
+	if !strings.Contains(declineRateQuery, "stage = 'capture'") || !strings.Contains(declineRateQuery, "is_synthetic = FALSE") || !strings.Contains(declineRateQuery, "INSTRUMENT_DECLINED") || !strings.Contains(declineRateQuery, "PAYER_CANNOT_PAY") || !strings.Contains(declineRateQuery, "PAYMENT_DENIED") || !strings.Contains(declineRateQuery, "ORDER_ALREADY_CAPTURED") || strings.Contains(declineRateQuery, "stage = 'reconcile'") {
 		t.Fatalf("decline-rate query must count real capture attempts only: %s", declineRateQuery)
+	}
+}
+
+func TestDeclineReasonDefinition(t *testing.T) {
+	for _, code := range []string{"INSTRUMENT_DECLINED", "PAYER_CANNOT_PAY", "PAYMENT_DENIED"} {
+		if !isDeclineReasonCode(code) {
+			t.Errorf("%s should be a decline", code)
+		}
+	}
+	for _, code := range []string{"ORDER_ALREADY_CAPTURED", "DUPLICATE_INVOICE_ID", "INSUFFICIENT_FUNDS", "UNCLASSIFIED", ""} {
+		if isDeclineReasonCode(code) {
+			t.Errorf("%s should not be a decline", code)
+		}
+	}
+}
+
+func TestWebhookCaptureEventsBecomeAttempts(t *testing.T) {
+	tests := []struct {
+		eventType string
+		resource  string
+		outcome   string
+		reason    string
+	}{
+		{"PAYMENT.CAPTURE.COMPLETED", `{"id":"CAP-1","amount":{"value":"25.00","currency_code":"USD"},"supplementary_data":{"related_ids":{"order_id":"ORDER-1"}}}`, "succeeded", "PAYMENT.CAPTURE.COMPLETED"},
+		{"PAYMENT.CAPTURE.DENIED", `{"id":"CAP-2","amount":{"value":"25.00","currency_code":"USD"},"status_details":{"reason":"INSTRUMENT_DECLINED"}}`, "declined", "INSTRUMENT_DECLINED"},
+		{"PAYMENT.CAPTURE.DENIED", `{"id":"CAP-3","amount":{"value":"25.00","currency_code":"USD"},"status_details":{"reason":"OTHER_REASON"}}`, "failed", "OTHER_REASON"},
+		{"PAYMENT.CAPTURE.REFUNDED", `{"id":"CAP-4","amount":{"value":"25.00","currency_code":"USD"}}`, "succeeded", "PAYMENT.CAPTURE.REFUNDED"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.eventType+"/"+tc.reason, func(t *testing.T) {
+			event := paypalWebhookEvent{ID: "EVENT", EventType: tc.eventType, Resource: json.RawMessage(tc.resource)}
+			attempt, supported, err := webhookAttempt(event)
+			if err != nil || !supported {
+				t.Fatalf("webhookAttempt supported=%v err=%v", supported, err)
+			}
+			if attempt.Stage != "webhook" || attempt.Outcome != tc.outcome || attempt.ReasonCode != tc.reason || attempt.AmountMinor != 2500 || attempt.Currency != "USD" {
+				t.Fatalf("attempt = %+v", attempt)
+			}
+		})
 	}
 }
 
@@ -749,7 +788,7 @@ func TestWebhookReceiptMigrationIsAdditiveAndDeduplicated(t *testing.T) {
 		t.Fatal(err)
 	}
 	sqlText := strings.ToLower(string(contents))
-	for _, fragment := range []string{"create table if not exists webhook_events", "event_id text primary key", "event_type text not null", "payload jsonb not null", "webhook_events_received_at_idx"} {
+	for _, fragment := range []string{"create table if not exists webhook_events", "event_id text primary key", "event_type text not null", "resource_id text", "payload jsonb not null", "processed_at timestamptz", "process_error text", "webhook_events_received_at_idx", "webhook_events_resource_id_idx"} {
 		if !strings.Contains(sqlText, fragment) {
 			t.Errorf("webhook receipt migration missing %q", fragment)
 		}
@@ -1146,23 +1185,19 @@ func TestCaptureOrderHandler_RetryReconciles(t *testing.T) {
 func TestPayPalWebhookHandlerVerifiesRawEventAndDeduplicates(t *testing.T) {
 	saveTransport(t)
 	rawEvent := []byte("{ \"id\":\"WH-EVENT-1\", \"event_type\":\"PAYMENT.CAPTURE.COMPLETED\",\"resource\":{\"id\":\"CAP-1\"} }")
-	var compactEvent bytes.Buffer
-	if err := json.Compact(&compactEvent, rawEvent); err != nil {
-		t.Fatal(err)
-	}
-	seen := make(map[string][]byte)
-	previousWriter := writeWebhookReceipt
-	writeWebhookReceipt = func(_ context.Context, eventID, eventType string, body []byte) (bool, error) {
-		if eventType != "PAYMENT.CAPTURE.COMPLETED" || !bytes.Equal(body, rawEvent) {
-			t.Errorf("stored webhook event type/body mismatch: type=%q body=%q", eventType, body)
+	previousProcessor := processVerifiedWebhook
+	seen := make(map[string]bool)
+	processCalls := 0
+	processVerifiedWebhook = func(_ context.Context, event paypalWebhookEvent, body []byte) (bool, error) {
+		processCalls++
+		if event.EventType != "PAYMENT.CAPTURE.COMPLETED" || !bytes.Equal(body, rawEvent) {
+			t.Errorf("processed webhook event/body mismatch: type=%q body=%q", event.EventType, body)
 		}
-		if _, exists := seen[eventID]; exists {
-			return false, nil
-		}
-		seen[eventID] = append([]byte(nil), body...)
-		return true, nil
+		duplicate := seen[event.ID]
+		seen[event.ID] = true
+		return duplicate, nil
 	}
-	t.Cleanup(func() { writeWebhookReceipt = previousWriter })
+	t.Cleanup(func() { processVerifiedWebhook = previousProcessor })
 
 	verifyCalls := 0
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -1174,19 +1209,11 @@ func TestPayPalWebhookHandlerVerifiesRawEventAndDeduplicates(t *testing.T) {
 			if req.Header.Get("Authorization") != "Bearer fake-token" {
 				t.Errorf("verification authorization header = %q", req.Header.Get("Authorization"))
 			}
-			var payload struct {
-				AuthAlgo        string          `json:"auth_algo"`
-				CertURL         string          `json:"cert_url"`
-				TransmissionID  string          `json:"transmission_id"`
-				TransmissionSig string          `json:"transmission_sig"`
-				TransmissionAt  string          `json:"transmission_time"`
-				WebhookID       string          `json:"webhook_id"`
-				WebhookEvent    json.RawMessage `json:"webhook_event"`
-			}
-			if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			requestBytes, err := io.ReadAll(req.Body)
+			if err != nil {
 				t.Errorf("decode signature verification payload: %v", err)
-			} else if payload.WebhookID != "WH-CONFIGURED" || string(payload.WebhookEvent) != compactEvent.String() || payload.TransmissionID != "tx-1" || payload.AuthAlgo != "SHA256withRSA" {
-				t.Errorf("signature verification payload mismatch: %+v event=%q", payload, payload.WebhookEvent)
+			} else if !bytes.Contains(requestBytes, rawEvent) || !bytes.Contains(requestBytes, []byte(`"webhook_id":"WH-CONFIGURED"`)) || !bytes.Contains(requestBytes, []byte(`"transmission_id":"tx-1"`)) {
+				t.Errorf("verification request did not preserve exact raw event bytes: %s", requestBytes)
 			}
 			return resp(http.StatusOK, `{"verification_status":"SUCCESS"}`), nil
 		default:
@@ -1214,20 +1241,20 @@ func TestPayPalWebhookHandlerVerifiesRawEventAndDeduplicates(t *testing.T) {
 	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"duplicate":true`) {
 		t.Fatalf("duplicate webhook response = %d %s", second.Code, second.Body.String())
 	}
-	if verifyCalls != 2 || len(seen) != 1 {
-		t.Fatalf("signature verifications=%d stored receipts=%d; want 2 verifications and one receipt", verifyCalls, len(seen))
+	if verifyCalls != 2 || processCalls != 2 || len(seen) != 1 {
+		t.Fatalf("signature verifications=%d process calls=%d receipts=%d; want two verifications/process calls and one receipt", verifyCalls, processCalls, len(seen))
 	}
 }
 
-func TestPayPalWebhookHandlerRejectsInvalidSignature(t *testing.T) {
+func TestPayPalWebhookHandlerRejectsTamperedBody(t *testing.T) {
 	saveTransport(t)
-	previousWriter := writeWebhookReceipt
-	writeCalls := 0
-	writeWebhookReceipt = func(context.Context, string, string, []byte) (bool, error) {
-		writeCalls++
-		return true, nil
+	previousProcessor := processVerifiedWebhook
+	processCalls := 0
+	processVerifiedWebhook = func(context.Context, paypalWebhookEvent, []byte) (bool, error) {
+		processCalls++
+		return false, nil
 	}
-	t.Cleanup(func() { writeWebhookReceipt = previousWriter })
+	t.Cleanup(func() { processVerifiedWebhook = previousProcessor })
 	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path == "/v1/oauth2/token" {
 			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
@@ -1245,7 +1272,71 @@ func TestPayPalWebhookHandlerRejectsInvalidSignature(t *testing.T) {
 	req.Header.Set("PayPal-Transmission-Time", "2026-11-06T12:00:00Z")
 	w := httptest.NewRecorder()
 	makePayPalWebhookHandler("fake-client", "fake-secret", "WH-CONFIGURED").ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized || writeCalls != 0 {
-		t.Fatalf("invalid signature response=%d writes=%d, want 401 and no receipt", w.Code, writeCalls)
+	if w.Code != http.StatusUnauthorized || processCalls != 0 {
+		t.Fatalf("tampered body response=%d processing=%d, want 401 and no receipt", w.Code, processCalls)
 	}
+}
+
+func TestPayPalWebhookHandlerFailsClosedWithoutWebhookID(t *testing.T) {
+	saveTransport(t)
+	var transportCalls int
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		transportCalls++
+		return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+	})
+	req := validWebhookRequest(`{"id":"WH-NO-ID","event_type":"PAYMENT.CAPTURE.COMPLETED"}`)
+	w := httptest.NewRecorder()
+	makePayPalWebhookHandler("fake-client", "fake-secret", " ").ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable || transportCalls != 0 {
+		t.Fatalf("missing webhook ID response=%d outbound calls=%d, want 503 and no PayPal calls", w.Code, transportCalls)
+	}
+}
+
+func TestPayPalWebhookUnprocessedDuplicateReprocessedAfterFailure(t *testing.T) {
+	saveTransport(t)
+	previousProcessor := processVerifiedWebhook
+	processedAtSet := false
+	processCalls := 0
+	processVerifiedWebhook = func(_ context.Context, event paypalWebhookEvent, _ []byte) (bool, error) {
+		processCalls++
+		if processedAtSet {
+			return true, nil
+		}
+		if processCalls == 1 {
+			return false, errors.New("simulated handler failure")
+		}
+		processedAtSet = true
+		return true, nil
+	}
+	t.Cleanup(func() { processVerifiedWebhook = previousProcessor })
+	httpClient.Transport = mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/oauth2/token" {
+			return resp(http.StatusOK, `{"access_token":"fake-token"}`), nil
+		}
+		if req.URL.Path == "/v1/notifications/verify-webhook-signature" {
+			return resp(http.StatusOK, `{"verification_status":"SUCCESS"}`), nil
+		}
+		return resp(http.StatusNotFound, `{}`), nil
+	})
+	body := `{"id":"WH-RETRY","event_type":"PAYMENT.CAPTURE.COMPLETED"}`
+	first := httptest.NewRecorder()
+	makePayPalWebhookHandler("id", "secret", "WH-1").ServeHTTP(first, validWebhookRequest(body))
+	if first.Code != http.StatusInternalServerError || processedAtSet {
+		t.Fatalf("first delivery status=%d processed=%v, want 500 and unprocessed", first.Code, processedAtSet)
+	}
+	second := httptest.NewRecorder()
+	makePayPalWebhookHandler("id", "secret", "WH-1").ServeHTTP(second, validWebhookRequest(body))
+	if second.Code != http.StatusOK || !processedAtSet || processCalls != 2 {
+		t.Fatalf("retry status=%d processed=%v calls=%d, want 200, processed, two calls", second.Code, processedAtSet, processCalls)
+	}
+}
+
+func validWebhookRequest(body string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/paypal", strings.NewReader(body))
+	req.Header.Set("PayPal-Auth-Algo", "SHA256withRSA")
+	req.Header.Set("PayPal-Cert-Url", "https://api.sandbox.paypal.com/cert")
+	req.Header.Set("PayPal-Transmission-Id", "tx-test")
+	req.Header.Set("PayPal-Transmission-Sig", "signature")
+	req.Header.Set("PayPal-Transmission-Time", "2026-11-06T12:00:00Z")
+	return req
 }

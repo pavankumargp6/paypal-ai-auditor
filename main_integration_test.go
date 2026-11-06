@@ -161,34 +161,58 @@ func TestPostgresLockPersistenceFailureRetryReconciles(t *testing.T) {
 	}
 }
 
-func TestPostgresWebhookReceiptDeduplicates(t *testing.T) {
+func TestPostgresWebhookFailureCanBeRetriedAndProcessedOnce(t *testing.T) {
 	testDB := openPostgresIntegrationDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	eventID := fmt.Sprintf("integration-webhook-%d", time.Now().UnixNano())
-	payload := []byte(fmt.Sprintf(`{"id":%q,"event_type":"PAYMENT.CAPTURE.COMPLETED"}`, eventID))
-	created, err := insertWebhookReceipt(ctx, testDB, eventID, "PAYMENT.CAPTURE.COMPLETED", payload)
-	if err != nil {
-		t.Fatalf("insert webhook receipt: %v", err)
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	eventID, captureID, orderID := "integration-webhook-"+suffix, "INTEGRATION-CAPTURE-"+suffix, "INTEGRATION-ORDER-"+suffix
+	payload := []byte(fmt.Sprintf(`{"id":%q,"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":%q,"amount":{"value":"25.00","currency_code":"USD"},"supplementary_data":{"related_ids":{"order_id":%q}}}}`, eventID, captureID, orderID))
+	var event paypalWebhookEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatal(err)
 	}
-	if !created {
-		t.Fatal("first webhook receipt insert was reported as duplicate")
+	t.Cleanup(func() {
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM attempts WHERE capture_id = $1`, captureID)
+		_, _ = testDB.ExecContext(context.Background(), `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+	})
+	previousWriter := insertWebhookAttempt
+	t.Cleanup(func() { insertWebhookAttempt = previousWriter })
+	insertWebhookAttempt = func(context.Context, webhookExecer, PaymentAttempt) error {
+		return errors.New("simulated attempt persistence failure")
 	}
-	created, err = insertWebhookReceipt(ctx, testDB, eventID, "PAYMENT.CAPTURE.COMPLETED", payload)
-	if err != nil {
-		t.Fatalf("insert duplicate webhook receipt: %v", err)
+	_, err := processWebhookReceipt(ctx, testDB, event, payload)
+	if err == nil {
+		t.Fatal("first processing should fail when the attempt insert is rejected")
 	}
-	if created {
-		t.Fatal("duplicate event_id insert created a second receipt")
+	insertWebhookAttempt = previousWriter
+	var processedAt sql.NullTime
+	var processError sql.NullString
+	if err := testDB.QueryRowContext(ctx, `SELECT processed_at, process_error FROM webhook_events WHERE event_id = $1`, eventID).Scan(&processedAt, &processError); err != nil {
+		t.Fatalf("read unprocessed receipt: %v", err)
 	}
-	var count int
-	if err := testDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM webhook_events WHERE event_id = $1`, eventID).Scan(&count); err != nil {
-		t.Fatalf("count webhook receipts: %v", err)
+	if processedAt.Valid || !processError.Valid {
+		t.Fatalf("after failed processing processed_at=%v process_error=%v; want NULL timestamp and recorded error", processedAt, processError)
 	}
-	if count != 1 {
-		t.Fatalf("webhook receipt count = %d, want exactly one", count)
+	if _, err := processWebhookReceipt(ctx, testDB, event, payload); err != nil {
+		t.Fatalf("retry unprocessed duplicate: %v", err)
 	}
-	_, _ = testDB.ExecContext(ctx, `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+	if _, err := processWebhookReceipt(ctx, testDB, event, payload); err != nil {
+		t.Fatalf("ack processed duplicate: %v", err)
+	}
+	if err := testDB.QueryRowContext(ctx, `SELECT processed_at, process_error FROM webhook_events WHERE event_id = $1`, eventID).Scan(&processedAt, &processError); err != nil {
+		t.Fatalf("read processed receipt: %v", err)
+	}
+	if !processedAt.Valid || processError.Valid {
+		t.Fatalf("after successful retry processed_at=%v process_error=%v; want timestamp and NULL error", processedAt, processError)
+	}
+	var attemptCount int
+	if err := testDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts WHERE capture_id = $1 AND stage = 'webhook'`, captureID).Scan(&attemptCount); err != nil {
+		t.Fatalf("count webhook attempts: %v", err)
+	}
+	if attemptCount != 1 {
+		t.Fatalf("webhook attempt count=%d, want exactly one", attemptCount)
+	}
 }
 
 func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {
