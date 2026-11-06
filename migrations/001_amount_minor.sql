@@ -1,8 +1,6 @@
 -- Additive migration: retain the legacy amount column for review and compatibility.
 -- Cast the legacy double to numeric before rounding, and reject values with sub-minor precision.
 -- Run manually only after reviewing the SQL and its verification checks.
-BEGIN;
-
 ALTER TABLE captures ADD COLUMN IF NOT EXISTS amount_minor BIGINT;
 
 DO $verify_legacy_precision$
@@ -70,5 +68,3 @@ BEGIN
     END IF;
 END;
 $verify_amount_minor$;
-
-COMMIT;
