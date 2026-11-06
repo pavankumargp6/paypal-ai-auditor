@@ -13,13 +13,13 @@ Build a sandbox-only PayPal revenue-leakage assistant while preserving the exist
 - `2576ea8 docs: record sandbox findings and ignore executables` — added Sandbox negative-test findings, scanned the document for credential-shaped content, and ignored `*.exe`. The pre-existing executable is not tracked.
 - `5f61a4a feat: store payment amounts in minor units` — added integer minor-unit parsing, string-encoded JSON fields, exact frontend formatting, and the additive `amount_minor` migration.
 - `6f0c387 fix: serialize PayPal order captures` — added deterministic `PayPal-Request-Id`, PostgreSQL per-order advisory locking, already-captured reconciliation, and a 12-request mocked concurrency test.
+- `0b43af7 fix: preserve legacy captures and verify lock recovery` — hardened the additive migration, added the legacy-row `COALESCE` fallback, set DB pool limits, wrote capture rows on the advisory-lock transaction, added env-gated PostgreSQL tests/CI, and added the migration runner.
 - Sandbox evidence is in `docs/sandbox-findings.md`. Supported negative-test mock responses returned specific `details[].issue` values. `INSUFFICIENT_FUNDS` as a mock code returned HTTP 403 with an empty body and is not listed in PayPal's Orders v2 error reference.
 
 ## In progress / next step
 
-- Follow-up changes prepared but not yet committed: numeric-first migration with sub-minor precision rejection; `COALESCE` support for legacy app rows; bounded DB pool; transaction-aware persistence; gated PostgreSQL integration tests and CI service; a Go migration runner with `schema_migrations`.
-- Current local checks: `go vet ./...` exited 0. `go test -race -count=1 ./...` passed with `ok paypal-ai-auditor 2.265s` and the migration runner package compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
-- The user must review the revised `migrations/001_amount_minor.sql` before it is applied to Render. Do not connect to Render or execute the migration until the user explicitly authorizes it.
+- Phase 1.0 follow-up is committed. Next: the user reviews the revised `migrations/001_amount_minor.sql`. Do not connect to Render or execute the migration until the user explicitly authorizes it.
+- Current local checks: `gofmt -l .` returned no files, `go vet ./...` exited 0, and `go test -race -count=1 ./...` passed with `ok paypal-ai-auditor 2.270s`; `cmd/migrate` compiled. The three PostgreSQL integration cases skip because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` is unset locally.
 - After review/application as directed, continue Phase 1.1 typed PayPal errors, then attempts and webhooks. Phase 2 decline classification still requires checking PayPal documentation for buyer-recoverable semantics before final wording.
 
 ## Decisions and reasons
