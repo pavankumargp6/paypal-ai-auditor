@@ -15,7 +15,7 @@ This section supersedes earlier verification and gap statements below.
 - Added additive migration 005, `migrations/005_action_money_moved_check.sql`, and included it in disposable CI migrations. Its SQL is documented in README. No production migration was run. Application code enforces the approval guard without migration 005; migration 004 is required before findings/action database routes work, while 005 adds the database-level guard.
 - README now documents token-authenticated writes, unauthenticated reads, the corrected evidence claims, all five migrations and exact PowerShell runner commands, and the limitations.
 - Local checks: `gofmt -l .` printed no files; `go vet ./...` exited successfully; `go test -race -count=1 -v ./...` passed. The eight PostgreSQL integration tests skipped locally because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` was intentionally unset; no database was accessed.
-- CI for this change, commit, and push are pending. Do not merge until the branch CI run is green and all PostgreSQL integration tests report PASS.
+- CI run [#46](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42366416984) passed for commit `425f86b26d2b0648c71891f33890fb1534a69e14`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including `TestPostgresDetectorsAndActionAudit`; none skipped. This handoff update is a follow-up documentation commit and must also pass CI before final submission.
 
 ### Pull request description
 
