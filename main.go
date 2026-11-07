@@ -375,9 +375,59 @@ func registerAPIRoutes(mux *http.ServeMux, clientID, clientSecret, groqKey, admi
 	mux.Handle("/api/capture-order", makeCaptureOrderHandler(clientID, clientSecret))
 	mux.HandleFunc("/api/spend-intelligence", makeSpendHandler(groqKey))
 	mux.HandleFunc("/api/transactions", makeTransactionsHandler())
+	mux.HandleFunc("/api/webhook-activity", makeWebhookActivityHandler())
 	registerFindingRoutes(mux, adminToken)
 	mux.HandleFunc("/api/actions/", makeApproveActionHandler(adminToken))
 	mux.HandleFunc("/webhooks/paypal", makePayPalWebhookHandler(clientID, clientSecret, webhookID))
+}
+
+type webhookActivityResponse struct {
+	ReceivedCount        int64      `json:"received_count"`
+	ProcessedCount       int64      `json:"processed_count"`
+	ProcessingErrorCount int64      `json:"processing_error_count"`
+	LastEventType        string     `json:"last_event_type"`
+	LastEventAt          *time.Time `json:"last_event_at"`
+}
+
+func makeWebhookActivityHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		var activity webhookActivityResponse
+		var lastEventType sql.NullString
+		var lastEventAt sql.NullTime
+		err := db.QueryRowContext(ctx, `SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE processed_at IS NOT NULL),
+			COUNT(*) FILTER (WHERE process_error IS NOT NULL AND process_error <> ''),
+			(SELECT event_type FROM webhook_events ORDER BY received_at DESC, event_id DESC LIMIT 1),
+			(SELECT received_at FROM webhook_events ORDER BY received_at DESC, event_id DESC LIMIT 1)
+			FROM webhook_events`).Scan(
+			&activity.ReceivedCount,
+			&activity.ProcessedCount,
+			&activity.ProcessingErrorCount,
+			&lastEventType,
+			&lastEventAt,
+		)
+		if err != nil {
+			sendJSONError(w, "Webhook activity query failed", http.StatusInternalServerError)
+			return
+		}
+		if lastEventType.Valid {
+			activity.LastEventType = lastEventType.String
+		}
+		if lastEventAt.Valid {
+			lastEventAtValue := lastEventAt.Time
+			activity.LastEventAt = &lastEventAtValue
+		}
+		writeJSON(w, http.StatusOK, activity)
+	}
 }
 
 func initDB(dbURL string) error {

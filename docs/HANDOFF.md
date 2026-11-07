@@ -17,6 +17,7 @@ This section supersedes earlier verification and gap statements below.
 - README documents token-protected findings/action writes, unauthenticated reads and checkout, the correct evidence claims, all five migrations and exact PowerShell runner commands, the 005 SQL and NOT VALID behavior, and private token provision for judges.
 - Local checks: `gofmt -l .` printed no files; `go vet ./...` exited successfully; `go test -race -count=1 -v ./...` passed. The eight PostgreSQL integration tests skipped locally because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` was intentionally unset; no database was accessed.
 - CI run [#48](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42370483910) passed for commit `f7019f7014475b839505973fe58d2ab0f5d45688`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including the unsafe-audit test with the tightened 005 constraint; none skipped. The 005 migration ran only against the disposable CI database, not production.
+- Added a public read-only `GET /api/webhook-activity` summary endpoint and dashboard panel. It reports received/processed counts, the count of events with a stored processing error, and last event type/time only; it deliberately omits IDs, error detail, payloads, and payer data. Unit coverage checks GET-only behavior, and PostgreSQL integration coverage verifies summary counts and non-disclosure against a payload fixture. Formatting, vet, race tests, commit, push, and CI for this panel are pending.
 
 ### Pull request description
 

@@ -35,6 +35,7 @@ flowchart LR
 3. Deterministic Go detectors inspect non-synthetic capture/webhook attempt data for duplicate captures and fee mismatches. The fee comparison uses a heuristic, not PayPal's full merchant-specific fee schedule.
 4. The dashboard displays live leakage totals separately from an explicitly labeled synthetic demo finding. “Recovered” is an `actioned` finding status, not proof a refund was sent.
 5. The spend-insight endpoint sends matched, non-synthetic completed capture evidence to Groq and displays the returned insight and citations.
+6. The read-only Webhook activity panel summarizes total received and processed events, events with a recorded processing error, and the most recently received event's type and timestamp. It never returns or displays webhook payloads.
 
 ## Safety boundaries
 
@@ -53,6 +54,8 @@ flowchart LR
 Webhook receipts use `event_id` as a primary key. The handler inserts with `ON CONFLICT (event_id) DO NOTHING`, then locks the stored receipt with `SELECT ... FOR UPDATE`. Supported capture events write their attempt and set `processed_at` in the same transaction. An already processed duplicate is acknowledged without another attempt. If processing fails, `processed_at` remains or is reset to `NULL`, an error marker is stored, and a later delivery can retry. Unsupported event types are stored and marked processed without writing an attempt.
 
 Webhook payloads are persisted and may contain payer data. Do not use this endpoint with production payer payloads.
+
+`GET /api/webhook-activity` returns only aggregate counts plus the last event type and received timestamp. It does not expose event IDs, processing-error text, webhook payloads, or payer data.
 
 ## Decline rate
 
