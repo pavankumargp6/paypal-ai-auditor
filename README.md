@@ -6,7 +6,7 @@ A sandbox-first revenue-monitoring dashboard for small merchants. It brings PayP
 
 Small merchants need a practical way to review payment activity and spot possible duplicate captures or fee mismatches without treating an AI-generated answer as a financial decision. This application records Sandbox payment attempts, runs deterministic Go detectors over recorded evidence, and presents findings and a Groq-generated summary in a browser dashboard.
 
-The findings workflow is for review and record-keeping. Finding changes and action proposals/approvals require the administrator's `ADMIN_TOKEN`; the browser prompts for it per operation and does not store it. Approval does not issue a refund or move money. The PayPal Sandbox checkout flow creates and captures a test payment after the Sandbox buyer approves it; those state-changing API calls also require the admin token.
+The findings workflow is for review and record-keeping. Finding detection/seeding, action proposals, and approvals require the administrator's `ADMIN_TOKEN`; the browser prompts for it per operation and does not store it. Approval does not issue a refund or move money. Sandbox checkout creates and captures a test payment after the Sandbox buyer approves it; PayPal validates the buyer approval and these checkout endpoints do not require the admin token.
 
 ## Architecture
 
@@ -41,8 +41,8 @@ flowchart LR
 - **Detection is deterministic.** Go code decides whether duplicate-capture or fee-mismatch findings exist and calculates their amounts. The LLM only generates spend insight; it does not determine finding status, amounts, or deterministic finding explanations.
 - **Evidence:** findings record capture IDs and any corresponding order ID available from attempts. The repeated-persisted-capture detector looks up an order ID through related attempts. Demo findings use synthetic IDs and are labeled and excluded from live totals.
 - **AI insight:** the model receives matched real completed capture evidence only, uses a strict JSON Schema response at temperature 0, and its cited order/capture pairs are checked against the supplied evidence.
-- **Write authentication:** state-changing application endpoints require `ADMIN_TOKEN` in the `X-Admin-Token` header and fail closed if the server token is unset. The UI prompts for the token per operation and does not persist or log it. PayPal webhooks instead require signature verification. Read-only API endpoints are unauthenticated, and the shared token does not establish an individual human identity.
-- **Action audit:** action proposals and approvals only record state and audit events. They do not call PayPal, send a refund, or move money. Approval refuses an existing action audit that reports `money_moved=true`. Migration 005 adds a database check for non-proposed actions with that audit flag; the application guard works even before migration 005 is applied.
+- **Write authentication:** finding detection/seeding, action proposals, and approvals require `ADMIN_TOKEN` in the `X-Admin-Token` header and fail closed if the server token is unset. Checkout is not gated by this admin token; PayPal Sandbox handles buyer approval. The UI prompts for the token per findings/action operation and does not persist or log it. PayPal webhooks instead require signature verification. Read-only API endpoints are unauthenticated, and the shared token does not establish an individual human identity.
+- **Action audit:** action proposals and approvals only record state and audit events. They do not call PayPal, send a refund, or move money. Approval refuses an existing action audit that reports `money_moved=true`. Migration 005 will reject any inserted or updated action whose JSON result contains `money_moved=true`, including proposed actions. The application approval guard works even before migration 005 is applied.
 - **Money representation:** application payment and finding amounts use integer minor units. The legacy `captures.amount` column remains `DOUBLE PRECISION` for compatibility; `amount_minor` is used for current money calculations.
 - **Sandbox only:** the payment flow targets PayPal Sandbox, not live payments.
 
@@ -70,7 +70,7 @@ Use Go 1.26.8 or a compatible Go toolchain. Configure the following environment 
 | `GROQ_API_KEY` | No for startup | Groq API key; spend insight is unavailable without a valid key. |
 | `APP_BASE_URL` | No for local development | PayPal return/cancel URL base; defaults to `http://localhost:8080`. Set it to the deployed app URL in Render. |
 | `PAYPAL_WEBHOOK_ID` | No for startup; required for webhook verification | PayPal Sandbox webhook ID. The webhook endpoint fails closed when it is missing. |
-| `ADMIN_TOKEN` | Required for state-changing application endpoints | Long, randomly generated administrator token. If unset, those endpoints fail closed. |
+| `ADMIN_TOKEN` | Required for findings/action write endpoints | Long, randomly generated administrator token. If unset, those endpoints fail closed. Not required for PayPal Sandbox checkout. |
 | `PORT` | No | HTTP listen port; defaults to `8080`. |
 
 The migration runner accepts exactly one migration-file argument and loads `.env` from the repository root. Run the migrations one at a time, in order, from the repository root. Do not rely on shell wildcard expansion:
@@ -83,22 +83,19 @@ go run ./cmd/migrate .\migrations\004_findings_actions.sql
 go run ./cmd/migrate .\migrations\005_action_money_moved_check.sql
 ```
 
-Migration 001 expects the legacy `captures` table to exist. Migrations 004 and 005 respectively add findings/actions storage and a database-level action audit guard. The findings and action routes cannot work against a database missing migration 004. Migration 005 is an additional database-level safeguard; application approval checks work without it. The runner records applied migration filenames in `schema_migrations` and applies each migration and its tracking record transactionally. Review migrations and target the intended database before running them.
+Migration 001 expects the legacy `captures` table to exist. Migrations 004 and 005 respectively add findings/actions storage and a database-level action audit guard. The findings and action routes cannot work against a database missing migration 004. Migration 005 is an additional database-level safeguard; application approval checks work without it. The runner records applied migration filenames in `schema_migrations` and applies each migration and its tracking record transactionally. Review migrations and target the intended database before running them. Migration 004 has been confirmed applied to the configured Render database; migration 005 has not been applied and requires separate approval.
 
 ### Proposed migration 005 SQL
 
-This migration has been added to the repository and CI, but must be separately approved before applying to any production database:
+This migration has been added to the repository and CI, but has not been applied to production. It must be separately approved before applying:
 
 ```sql
 ALTER TABLE actions
     ADD CONSTRAINT actions_no_money_moved_after_proposal_check
-    CHECK (
-        status = 'proposed'
-        OR NOT jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')
-    ) NOT VALID;
+    CHECK (NOT jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')) NOT VALID;
 ```
 
-`NOT VALID` leaves historical rows untouched while PostgreSQL enforces the check for new or updated rows. The application rejects an unsafe proposed row before changing its status.
+The check rejects `money_moved=true` anywhere in the JSON result for every action status, including `proposed`. `NOT VALID` means PostgreSQL does not scan or reject existing rows when adding the constraint; legacy violating rows remain until explicitly remediated. New rows must satisfy the check, and updates to an existing violating row fail unless that update also removes the violation. This migration has not been approved or applied to production.
 
 Start the application:
 
@@ -120,10 +117,11 @@ PostgreSQL integration tests use only `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`. Wit
 
 - **Live app:** [paypal-ai-auditor.onrender.com](https://paypal-ai-auditor.onrender.com)
 - **Video walkthrough:** [Add video link](VIDEO_LINK_TBD)
+- **Judge approvals:** Seed the labeled demo finding, then use its “Approve Refund” button. The UI prompts for the shared `ADMIN_TOKEN` and submits the proposal and approval; provide the token to judges privately through the event's approved channel. Never commit or embed a real token in the public repository. This records a demo action only; no refund is sent.
 
 ## Limitations
 
-- Read-only API endpoints are unauthenticated. Write endpoints use one shared admin token and do not identify a specific human approver.
+- Read-only API endpoints are unauthenticated; checkout is not admin-token protected. Findings/action writes use one shared token and do not identify a specific human approver.
 - Payments and webhook verification use PayPal Sandbox only. Sandbox negative-test reason codes do not prove production buyer behavior.
 - Synthetic data is labeled and excluded from live metrics. The demo finding has synthetic order and capture identifiers.
 - Stored webhook payloads may contain payer data; use Sandbox payloads only.

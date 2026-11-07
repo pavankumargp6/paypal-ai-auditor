@@ -221,6 +221,29 @@ func TestRequireAdminToken(t *testing.T) {
 	}
 }
 
+func TestAPIRouteAuthenticationScopes(t *testing.T) {
+	mux := http.NewServeMux()
+	registerAPIRoutes(mux, "fake-client", "fake-secret", "", "", "")
+
+	for _, path := range []string{"/api/create-order", "/api/capture-order"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s without token returned %d, want method validation before authentication", path, response.Code)
+		}
+	}
+
+	for _, path := range []string{"/api/findings/detect", "/api/findings/seed-demo", "/api/findings/1/action", "/api/actions/1/approve"} {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"action_type":"test"}`))
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s without configured token returned %d, want fail-closed 503", path, response.Code)
+		}
+	}
+}
+
 func TestAuditReportsMoneyMoved(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -915,13 +938,15 @@ func TestActionMoneyMovedConstraintMigration(t *testing.T) {
 	for _, fragment := range []string{
 		"alter table actions",
 		"actions_no_money_moved_after_proposal_check",
-		"status = 'proposed'",
-		"jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')",
+		"not jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')",
 		"not valid",
 	} {
 		if !strings.Contains(sqlText, fragment) {
 			t.Errorf("migration 005 missing %q", fragment)
 		}
+	}
+	if strings.Contains(sqlText, "status = 'proposed'") {
+		t.Fatal("migration 005 must reject money_moved=true for every action status")
 	}
 	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "drop constraint") {
 		t.Fatal("migration 005 must be additive")

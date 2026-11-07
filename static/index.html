@@ -492,15 +492,10 @@
         async function startCheckout() {
             closeReviewModal();
             const button = document.getElementById("paypal-btn");
-            const adminToken = promptAdminToken();
-            if (!adminToken) return;
             button.disabled = true;
             button.textContent = "Redirecting to PayPal…";
             try {
-                const order = await apiJSON("/api/create-order", {
-                    method: "POST",
-                    headers: adminHeaders(adminToken)
-                });
+                const order = await apiJSON("/api/create-order", { method: "POST" });
                 if (!order.approveURL) throw new Error("PayPal approval URL was not returned.");
                 window.location.href = order.approveURL;
             } catch (error) {
@@ -512,16 +507,11 @@
         }
 
         async function captureOrder(orderID) {
-            const adminToken = promptAdminToken();
-            if (!adminToken) {
-                document.getElementById("ai-insight").textContent = "Admin token is required to capture the Sandbox payment.";
-                return;
-            }
             document.getElementById("ai-insight").textContent = "Verifying and capturing your Sandbox payment…";
             try {
                 const result = await apiJSON("/api/capture-order", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ orderID })
                 });
                 if (result.status === "capture_succeeded_persistence_pending") {

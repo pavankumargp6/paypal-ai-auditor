@@ -8,22 +8,23 @@ Branch: `feat/revenue-guardian`
 
 This section supersedes earlier verification and gap statements below.
 
+- Ran `go run ./cmd/migrate .\migrations\004_findings_actions.sql` from the repository root using its `.env` configuration. Runner reported `migration already applied: 004_findings_actions.sql`; no DDL was newly applied. A read-only schema query confirmed the `findings` and `actions` tables and their columns in the configured Render database. Migration 005 was not run.
 - Refused action approval with HTTP 409 and a clear message when the stored action audit contains `money_moved=true`; added unit coverage and retained/updated the PostgreSQL integration test to assert the unsafe row remains unchanged.
-- Added `ADMIN_TOKEN` authentication using `crypto/subtle` for payment writes, finding detection/seeding/action proposals, and approvals. An unset token fails closed. The browser asks for the token per operation and neither persists nor logs it. `.env.example` and README document the setting.
+- Added `ADMIN_TOKEN` authentication using `crypto/subtle` for finding detection/seeding, action proposals, and approvals. Checkout creation/capture do not require the admin token; PayPal Sandbox buyer approval remains part of checkout. An unset admin token fails closed for findings/action writes. The browser asks for it per protected operation and neither persists nor logs it. `.env.example` and README document the setting and judge token handling.
 - Repeated-persisted-capture findings resolve an available PayPal order ID through related attempts; unit and PostgreSQL integration coverage assert the evidence.
 - Added `.gitattributes` (`*.go text eol=lf`) and normalized tracked Go files.
-- Added additive migration 005, `migrations/005_action_money_moved_check.sql`, and included it in disposable CI migrations. Its SQL is documented in README. No production migration was run. Application code enforces the approval guard without migration 005; migration 004 is required before findings/action database routes work, while 005 adds the database-level guard.
-- README now documents token-authenticated writes, unauthenticated reads, the corrected evidence claims, all five migrations and exact PowerShell runner commands, and the limitations.
+- Added additive migration 005, `migrations/005_action_money_moved_check.sql`, and included it in disposable CI migrations. The check rejects `money_moved=true` anywhere in an action result, including proposed status. `NOT VALID` leaves historical violating rows in place and does not scan them when adding the constraint, but PostgreSQL enforces it for new rows and updated rows. Migration 005 has not been applied to production. Migration 004 is already present in the configured Render database.
+- README documents token-protected findings/action writes, unauthenticated reads and checkout, the correct evidence claims, all five migrations and exact PowerShell runner commands, the 005 SQL and NOT VALID behavior, and private token provision for judges.
 - Local checks: `gofmt -l .` printed no files; `go vet ./...` exited successfully; `go test -race -count=1 -v ./...` passed. The eight PostgreSQL integration tests skipped locally because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` was intentionally unset; no database was accessed.
-- CI run [#46](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42366416984) passed for commit `425f86b26d2b0648c71891f33890fb1534a69e14`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including `TestPostgresDetectorsAndActionAudit`; none skipped. This handoff update is a follow-up documentation commit and must also pass CI before final submission.
+- CI run [#47](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42366569470) passed for commit `39529ecc8b6187f31b23e0a150c465b32a8db49f`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including `TestPostgresDetectorsAndActionAudit`; none skipped. Current requested changes to the 005 constraint and checkout authentication are pending commit and CI.
 
 ### Pull request description
 
 **Title:** Secure PayPal Sandbox revenue-leakage review and add action audit guard
 
-**Summary:** Refuse approval of unsafe stored action audits, require an administrator token for state-changing endpoints, include available order IDs in repeated-capture evidence, and add an additive database check. Update the UI, migration workflow, and documentation. No refunds or other money movement are performed by action approval.
+**Summary:** Refuse approval of unsafe stored action audits, require an administrator token for findings/action writes, include available order IDs in repeated-capture evidence, and add an additive database check. Update the UI, migration workflow, and documentation. No refunds or other money movement are performed by action approval.
 
-**Deployment notes:** The requester reports migrations 001–003 are already applied in production; this was not independently checked. Apply migration 004 before deploying/relying on findings and action routes. Migration 005 adds a database-level audit safeguard; the application-level approval guard is enforced without it, but applying 005 is recommended. Set `APP_BASE_URL` and `PAYPAL_WEBHOOK_ID` in Render. No production database or Render settings were changed. Obtain approval before applying any production migration.
+**Deployment notes:** Migration 004 was confirmed present in the configured Render database by the runner and a read-only schema query. Migration 005 has not been applied; the tightened database-level audit safeguard still requires separate approval. Set `APP_BASE_URL` and `PAYPAL_WEBHOOK_ID` in Render. Checkout endpoints do not require `ADMIN_TOKEN`; findings/action writes do.
 
 ## Pre-submission verification (2026-11-07)
 

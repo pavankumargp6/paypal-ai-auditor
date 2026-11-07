@@ -459,9 +459,26 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 		VALUES ($1, 'duplicate_capture', 2500, 'USD', '{}'::jsonb) RETURNING id`, unsafeFingerprint).Scan(&unsafeFindingID); err != nil {
 		t.Fatalf("insert finding for unsafe action check: %v", err)
 	}
-	if err := testDB.QueryRowContext(ctx, `INSERT INTO actions (finding_id, action_type, status, result)
+	legacyFixture, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin legacy unsafe action fixture: %v", err)
+	}
+	if _, err := legacyFixture.ExecContext(ctx, `ALTER TABLE actions DROP CONSTRAINT actions_no_money_moved_after_proposal_check`); err != nil {
+		_ = legacyFixture.Rollback()
+		t.Fatalf("temporarily remove action audit constraint for legacy fixture: %v", err)
+	}
+	if err := legacyFixture.QueryRowContext(ctx, `INSERT INTO actions (finding_id, action_type, status, result)
 		VALUES ($1, 'unsafe_test', 'proposed', '{"events":[],"money_moved":true,"execution_mode":"record_only"}'::jsonb) RETURNING id`, unsafeFindingID).Scan(&unsafeActionID); err != nil {
+		_ = legacyFixture.Rollback()
 		t.Fatalf("insert unsafe action fixture: %v", err)
+	}
+	if _, err := legacyFixture.ExecContext(ctx, `ALTER TABLE actions ADD CONSTRAINT actions_no_money_moved_after_proposal_check
+		CHECK (NOT jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')) NOT VALID`); err != nil {
+		_ = legacyFixture.Rollback()
+		t.Fatalf("restore action audit constraint: %v", err)
+	}
+	if err := legacyFixture.Commit(); err != nil {
+		t.Fatalf("commit legacy unsafe action fixture: %v", err)
 	}
 	unsafeApproveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", unsafeActionID), nil)
 	unsafeApproveRequest.Header.Set("X-Admin-Token", testAdminToken)
