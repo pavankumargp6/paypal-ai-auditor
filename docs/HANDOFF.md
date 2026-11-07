@@ -7,7 +7,7 @@ Branch: `feat/revenue-guardian`
 ## Pre-submission verification (2026-11-07)
 
 - The initial worktree was clean at `86bfe14` but one commit behind `origin/feat/revenue-guardian`. It was fast-forwarded to `54aa758` (`Revamp spend intelligence dashboard UI`); that source commit matched the remote and the worktree was clean before documentation edits.
-- No application code was changed during this verification. No database, Render settings, PayPal endpoint, or Groq endpoint was accessed. The requester reports migrations 001–003 are already applied in production; this was not independently checked. Earlier handoff notes say migration 004 had not been applied to Render; its current production status was not checked.
+- No application code was changed during this verification. Local checks did not access a database, Render settings, PayPal, or Groq. The pushed CI workflow uses its own disposable PostgreSQL service; no production/application database or Render settings were accessed. The requester reports migrations 001–003 are already applied in production; this was not independently checked. Earlier handoff notes say migration 004 had not been applied to Render; its current production status was not checked.
 - Local checks on the source commit, with `DATABASE_URL` and `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` removed from the test process:
   - `gofmt -l .` printed `actions.go` and `main.go`. The Windows worktree has CRLF line endings for these two files (`git ls-files --eol`: index LF, worktree CRLF), and local Go is 1.27.3 while `go.mod` and CI use Go 1.26.8. The CI gofmt step passed for this source commit.
   - `go vet ./...` exited successfully with no output.
