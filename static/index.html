@@ -2,228 +2,549 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f8fafc">
     <title>PayPal Spend Intelligence Agent</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/styles/ag-grid.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/styles/ag-theme-quartz.css">
     <script src="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/dist/ag-grid-community.min.js"></script>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; margin: 0; padding: 40px; background: #f4f7f9; color: #1e293b; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-        .header h1 { margin: 0; font-size: 2rem; color: #0f172a; }
-        .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; }
-        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-        .card-title { font-size: 0.85rem; text-transform: uppercase; color: #64748b; font-weight: 600; }
-        .card-value { font-size: 2rem; font-weight: bold; color: #0f172a; margin-top: 5px; }
-        .controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .filter-select { padding: 8px 12px; border-radius: 6px; border: 1px solid #cbd5e1; font-size: 1rem; }
-        .checkout-area { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; }
-        .grid-container { background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); height: 400px; width: 100%; }
-        .ag-theme-quartz { --ag-foreground-color: #1e293b; }
-        .paypal-btn { background-color: #ffc439; color: #003087; border: none; border-radius: 4px; padding: 12px 30px; font-size: 1.1rem; font-weight: bold; font-style: italic; cursor: pointer; }
-        .paypal-btn:hover { background-color: #f2ba36; }
-        .paypal-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        :root { color-scheme: light; }
+        body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        .surface { border: 1px solid #e2e8f0; border-radius: 1rem; background: #fff; box-shadow: 0 8px 30px rgba(15, 23, 42, .045); }
+        .score-card { min-width: 0; border: 1px solid #e2e8f0; border-radius: .875rem; background: #fff; padding: 1.25rem; }
+        .score-card.live-lost { border-top: 3px solid #f43f5e; }
+        .score-card.live-recoverable { border-top: 3px solid #f59e0b; }
+        .score-card.live-recovered { border-top: 3px solid #10b981; }
+        .score-value { margin-top: .55rem; font-size: clamp(1.65rem, 3vw, 2.25rem); font-weight: 700; letter-spacing: -.04em; color: #0f172a; }
+        .demo-card { border-style: dashed; background: #f8fafc; padding: 1rem; }
+        .demo-card .score-value { font-size: 1.35rem; color: #475569; }
+        .action-button { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; gap: .55rem; border: 0; border-radius: .7rem; padding: .7rem 1rem; font-weight: 650; transition: background .15s, transform .15s; }
+        .action-button:hover:not(:disabled) { transform: translateY(-1px); }
+        .action-button:disabled { cursor: wait; opacity: .6; }
+        .ag-theme-quartz { --ag-font-family: inherit; --ag-font-size: 13px; --ag-foreground-color: #334155; --ag-header-foreground-color: #64748b; --ag-header-background-color: #f8fafc; --ag-row-hover-color: #f1f5f9; --ag-border-color: #e2e8f0; --ag-wrapper-border-radius: 0; }
+        .ag-theme-quartz .ag-row-odd { background: #f8fafc; }
+        .ag-theme-quartz .ag-header-cell-text { font-weight: 650; }
+        .grid-container { height: 390px; width: 100%; }
+        .status-badge, .source-badge { display: inline-flex; align-items: center; border-radius: 9999px; padding: .25rem .6rem; font-size: .72rem; font-weight: 700; white-space: nowrap; }
+        .status-completed { color: #047857; background: #d1fae5; }
+        .status-declined { color: #be123c; background: #ffe4e6; }
+        .status-other { color: #475569; background: #e2e8f0; }
+        .source-live { color: #1d4ed8; background: #dbeafe; }
+        .source-synthetic { color: #a16207; background: #fef3c7; }
+        .modal-backdrop { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; background: rgba(15, 23, 42, .55); padding: 1rem; }
+        .modal-backdrop.is-open { display: flex; }
+        @media (max-width: 640px) {
+            .grid-container { height: 430px; }
+            .ag-theme-quartz { --ag-font-size: 12px; }
+        }
     </style>
 </head>
-<body>
-    <div class="header">
-        <h1>💳 PayPal Spend Intelligence Agent</h1>
-        <div class="badge" id="ai-insight" style="background:#e0f2fe; color:#0369a1; padding:10px 20px; border-radius:20px; font-weight:600;">Loading AI Insights...</div>
-    </div>
+<body class="min-h-screen bg-slate-50 text-slate-700 antialiased">
+    <header class="border-b border-slate-200 bg-white">
+        <div class="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
+            <div class="flex items-center gap-3">
+                <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-700 text-xl text-white shadow-sm" aria-hidden="true">⌁</div>
+                <div>
+                    <p class="text-xs font-semibold uppercase tracking-[.16em] text-slate-400">Merchant dashboard</p>
+                    <h1 class="text-lg font-bold tracking-tight text-slate-900 sm:text-xl">PayPal Spend Intelligence Agent</h1>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 self-start rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800 sm:self-auto">
+                <span class="h-2 w-2 rounded-full bg-amber-500" aria-hidden="true"></span>
+                Sandbox Mode
+            </div>
+        </div>
+    </header>
 
-    <div class="summary-grid">
-        <div class="card">
-            <div class="card-title">Live Captured Revenue</div>
-            <div class="card-value" id="total-revenue">$0.00</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Live Successful Payments</div>
-            <div class="card-value" id="total-success">0</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Demo Completed (Synthetic)</div>
-            <div class="card-value" id="demo-success" style="color:#64748b;">0</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Decline Rate</div>
-            <div class="card-value" style="color:#ef4444; font-size:1.2rem; margin-top:10px;">Not Tracked</div>
-        </div>
-    </div>
+    <main class="mx-auto max-w-7xl space-y-6 px-4 py-7 sm:px-6 sm:py-9 lg:px-8">
+        <section class="surface overflow-hidden p-5 sm:p-7" aria-labelledby="leakage-title">
+            <div class="mb-6 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                    <div class="mb-2 flex items-center gap-2">
+                        <span class="h-2 w-2 animate-pulse rounded-full bg-emerald-500" aria-hidden="true"></span>
+                        <p class="text-xs font-bold uppercase tracking-[.16em] text-emerald-700">Revenue health</p>
+                    </div>
+                    <h2 id="leakage-title" class="text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">Revenue Leakage Score</h2>
+                    <p class="mt-2 max-w-2xl text-sm leading-6 text-slate-500">See what is lost, what can be recovered, and what has been actioned across your payment activity.</p>
+                </div>
+                <div class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+                    <button class="action-button w-full bg-slate-900 text-white hover:bg-slate-800 sm:w-auto" id="seed-demo-btn" type="button">
+                        <span aria-hidden="true">✦</span> 1. Seed Demo Leak
+                    </button>
+                    <button class="action-button w-full bg-blue-700 text-white shadow-sm hover:bg-blue-800 sm:w-auto" id="run-audit-btn" type="button">
+                        <span aria-hidden="true">↻</span> 2. Run Audit
+                    </button>
+                </div>
+            </div>
 
-    <div class="checkout-area">
-        <div>
-            <h3 style="margin:0 0 5px 0;">Real PayPal Sandbox Checkout</h3>
-            <p style="margin:0; color:#64748b; font-size:0.9rem;">Click the button, log in with a Sandbox Buyer account, and approve the $25.00 payment.</p>
-        </div>
-        <button class="paypal-btn" id="paypal-btn" onclick="openReviewModal()">PayPal</button>
-    </div>
+            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <article class="score-card live-lost">
+                    <p class="text-sm font-semibold text-slate-500">Lost</p>
+                    <p class="score-value" id="leakage-lost">$0.00</p>
+                    <p class="mt-2 text-xs text-slate-400">Open findings</p>
+                </article>
+                <article class="score-card live-recoverable">
+                    <p class="text-sm font-semibold text-slate-500">Recoverable</p>
+                    <p class="score-value" id="leakage-recoverable">$0.00</p>
+                    <p class="mt-2 text-xs text-slate-400">Open and acknowledged</p>
+                </article>
+                <article class="score-card live-recovered">
+                    <p class="text-sm font-semibold text-slate-500">Recovered</p>
+                    <p class="score-value" id="leakage-recovered">$0.00</p>
+                    <p class="mt-2 text-xs text-slate-400">Actioned findings</p>
+                </article>
+            </div>
 
-    <div id="order-review-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center;">
-        <div style="background:#fff; border-radius:12px; padding:30px; max-width:480px; width:90%; box-shadow:0 8px 32px rgba(0,0,0,0.2);">
-            <h2 style="margin-top:0; color:#0f172a;">Review your order</h2>
-            <table style="width:100%; border-collapse:collapse; margin-bottom:20px;">
-                <tr>
-                    <td style="padding:8px 0; color:#64748b;">Item</td>
-                    <td style="padding:8px 0; text-align:right; font-weight:600;">PayPal Spend Intelligence Agent — Sandbox Test Payment</td>
-                </tr>
-                <tr>
-                    <td style="padding:8px 0; color:#64748b;">Quantity</td>
-                    <td style="padding:8px 0; text-align:right; font-weight:600;">1</td>
-                </tr>
-                <tr style="border-top:1px solid #e2e8f0;">
-                    <td style="padding:12px 0; color:#64748b; font-weight:600;">Total</td>
-                    <td style="padding:12px 0; text-align:right; font-weight:700; color:#0f172a;">$25.00 USD</td>
-                </tr>
-            </table>
-            <div style="display:flex; gap:12px; justify-content:flex-end;">
-                <button onclick="closeReviewModal()" style="background:#e2e8f0; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:600;">Cancel</button>
-                <button id="continue-to-paypal-btn" onclick="startCheckout()" style="background:#ffc439; color:#003087; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:700;">Continue to PayPal</button>
+            <div class="mt-6 border-t border-slate-100 pt-5">
+                <div class="mb-3 flex flex-wrap items-center gap-2">
+                    <h3 class="text-sm font-bold text-slate-700">Simulated Demo</h3>
+                    <span class="rounded-full bg-amber-100 px-2.5 py-1 text-[.68rem] font-bold uppercase tracking-wide text-amber-800">Synthetic · excluded from live totals</span>
+                </div>
+                <div class="grid gap-3 sm:grid-cols-3">
+                    <article class="score-card demo-card"><p class="text-xs font-semibold text-slate-500">Simulated Lost</p><p class="score-value" id="simulated-leakage-lost">$0.00</p></article>
+                    <article class="score-card demo-card"><p class="text-xs font-semibold text-slate-500">Simulated Recoverable</p><p class="score-value" id="simulated-leakage-recoverable">$0.00</p></article>
+                    <article class="score-card demo-card"><p class="text-xs font-semibold text-slate-500">Simulated Recovered</p><p class="score-value" id="simulated-leakage-recovered">$0.00</p></article>
+                </div>
+            </div>
+            <p class="mt-4 text-xs leading-5 text-slate-400">Amounts are minor-unit accurate. “Recovered” reflects an actioned status; it does not mean a refund was sent. Demo actions never move money.</p>
+            <p id="findings-status" class="mt-3 text-sm text-slate-600" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="flex flex-col gap-4 rounded-2xl border border-blue-100 bg-gradient-to-r from-blue-50 to-sky-50 p-5 sm:flex-row sm:items-start sm:p-6" aria-labelledby="insight-title">
+            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-white text-2xl shadow-sm" aria-hidden="true">🤖</div>
+            <div class="min-w-0">
+                <p id="insight-title" class="text-xs font-bold uppercase tracking-[.15em] text-blue-700">AI spend insight</p>
+                <p id="ai-insight" class="mt-1 text-base font-semibold leading-7 text-slate-800">Analyzing your recent payment activity…</p>
+                <p id="ai-insight-citations" class="mt-2 break-words text-xs leading-5 text-slate-500"></p>
+            </div>
+        </section>
+
+        <section class="surface p-5 sm:p-6" aria-labelledby="findings-title">
+            <div class="mb-5 flex flex-col gap-1">
+                <p class="text-xs font-bold uppercase tracking-[.15em] text-blue-700">Action center</p>
+                <h2 id="findings-title" class="text-xl font-bold tracking-tight text-slate-900">Active Findings</h2>
+                <p class="text-sm leading-6 text-slate-500">Review potential leakage and record a demo approval. No refund is issued and no money moves.</p>
+            </div>
+            <div id="findings-list" class="space-y-3" aria-live="polite">
+                <p class="rounded-xl bg-slate-50 px-4 py-5 text-sm text-slate-500">Loading active findings…</p>
+            </div>
+        </section>
+
+        <section class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4" aria-label="Payment overview">
+            <article class="surface p-5"><p class="text-sm font-semibold text-slate-500">Live Captured Revenue</p><p class="mt-2 text-2xl font-bold tracking-tight text-slate-900" id="total-revenue">$0.00</p></article>
+            <article class="surface p-5"><p class="text-sm font-semibold text-slate-500">Live Successful Payments</p><p class="mt-2 text-2xl font-bold tracking-tight text-slate-900" id="total-success">0</p></article>
+            <article class="surface p-5"><p class="text-sm font-semibold text-slate-500">Demo Completed</p><p class="mt-2 text-2xl font-bold tracking-tight text-slate-500" id="demo-success">0</p></article>
+            <article class="surface p-5"><p class="text-sm font-semibold text-slate-500">Decline Rate</p><p class="mt-2 text-2xl font-bold tracking-tight text-rose-600" id="decline-rate">No data yet</p><p class="mt-1 text-xs leading-5 text-slate-400">Based on sandbox negative-testing reason codes.</p></article>
+        </section>
+
+        <section class="surface flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6" aria-labelledby="checkout-title">
+            <div>
+                <p class="text-xs font-bold uppercase tracking-[.15em] text-blue-700">Sandbox checkout</p>
+                <h2 id="checkout-title" class="mt-1 text-lg font-bold text-slate-900">Test a $25.00 payment</h2>
+                <p class="mt-1 max-w-2xl text-sm leading-6 text-slate-500">Use a PayPal Sandbox Buyer account to review and approve a test payment.</p>
+            </div>
+            <button class="action-button shrink-0 bg-amber-400 text-slate-950 hover:bg-amber-300" id="paypal-btn" type="button">Continue with PayPal <span aria-hidden="true">→</span></button>
+        </section>
+
+        <section class="surface overflow-hidden" aria-labelledby="transactions-title">
+            <div class="flex flex-col gap-3 border-b border-slate-100 px-5 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+                <div>
+                    <p class="text-xs font-bold uppercase tracking-[.15em] text-slate-400">Payments</p>
+                    <h2 id="transactions-title" class="mt-1 text-xl font-bold tracking-tight text-slate-900">Transaction History</h2>
+                </div>
+                <label class="flex items-center gap-2 text-sm font-medium text-slate-600">
+                    <span class="sr-only">Filter transactions</span>
+                    <select class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100" id="source-filter">
+                        <option value="all">All transactions</option>
+                        <option value="live">PayPal Sandbox (Live)</option>
+                        <option value="demo">Synthetic Demo</option>
+                    </select>
+                </label>
+            </div>
+            <div id="transactions-status" class="px-5 pt-4 text-sm text-rose-700 sm:px-6" role="status"></div>
+            <div class="overflow-x-auto px-2 pb-3 sm:px-4">
+                <div id="spendGrid" class="grid-container ag-theme-quartz"></div>
+            </div>
+        </section>
+    </main>
+
+    <div id="order-review-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="review-title">
+        <div class="w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
+            <p class="text-xs font-bold uppercase tracking-[.15em] text-blue-700">PayPal Sandbox</p>
+            <h2 id="review-title" class="mt-2 text-2xl font-bold tracking-tight text-slate-900">Review your order</h2>
+            <div class="my-6 space-y-4 rounded-xl bg-slate-50 p-4 text-sm">
+                <div class="flex justify-between gap-4"><span class="text-slate-500">Item</span><span class="text-right font-semibold text-slate-800">Sandbox Test Payment</span></div>
+                <div class="flex justify-between"><span class="text-slate-500">Quantity</span><span class="font-semibold text-slate-800">1</span></div>
+                <div class="flex justify-between border-t border-slate-200 pt-4"><span class="font-semibold text-slate-600">Total</span><span class="font-bold text-slate-900">$25.00 USD</span></div>
+            </div>
+            <p class="mb-5 text-xs leading-5 text-slate-500">This starts a real payment flow in PayPal Sandbox. Do not use production account credentials.</p>
+            <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button class="action-button bg-slate-100 text-slate-700 hover:bg-slate-200" id="cancel-review-btn" type="button">Cancel</button>
+                <button class="action-button bg-amber-400 text-slate-950 hover:bg-amber-300" id="continue-to-paypal-btn" type="button">Continue to PayPal</button>
             </div>
         </div>
     </div>
 
-    <div class="controls">
-        <h3 style="margin:0;">Transaction History</h3>
-        <select class="filter-select" id="source-filter" onchange="applyFilter()">
-            <option value="all">Show All Data</option>
-            <option value="live">Show ONLY Live PayPal Sandbox</option>
-            <option value="demo">Show ONLY Synthetic Demo Data</option>
-        </select>
-    </div>
-
-    <div id="spendGrid" class="grid-container ag-theme-quartz"></div>
-
     <script>
-        console.log("[boot] script starting");
-        console.log("[boot] agGrid available:", typeof agGrid);
-
         let spendGridApi = null;
-        window.allTransactions = [];
+        let allTransactions = [];
 
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log("[boot] DOM ready");
+        function formatMinorCurrency(minor, currency = "USD") {
+            currency = String(currency || "USD").toUpperCase();
+            const normalizedCurrency = currency;
+            const exponent = ["JPY", "HUF", "TWD"].includes(normalizedCurrency) ? 0 : 2;
+            const amount = BigInt(minor ?? "0");
+            const scale = 10n ** BigInt(exponent);
+            const absolute = amount < 0n ? -amount : amount;
+            const whole = absolute / scale;
+            const fraction = absolute % scale;
+            const signedWhole = amount < 0n ? -whole : whole;
+            const formatted = new Intl.NumberFormat("en-US", {
+                style: "currency", currency, maximumFractionDigits: 0
+            }).format(signedWhole);
+            if (exponent === 0) return formatted;
+            return formatted + "." + fraction.toString().padStart(exponent, "0");
+        }
 
-            const gridDiv = document.querySelector('#spendGrid');
-            console.log("[grid] container found:", !!gridDiv, "offsetHeight:", gridDiv ? gridDiv.offsetHeight : 'N/A');
-
+        async function apiJSON(url, options) {
+            const response = await fetch(url, options);
+            let data;
             try {
-                spendGridApi = agGrid.createGrid(gridDiv, {
-                    columnDefs: [
-                        { field: "id", headerName: "Capture ID", flex: 2 },
-                        { field: "amount", headerName: "Amount", flex: 1, valueFormatter: p => '$' + Number(p.value || 0).toFixed(2) },
-                        { field: "status", headerName: "Status", flex: 1,
-                          cellStyle: p => p.value === "COMPLETED" ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#ef4444' }
-                        },
-                        { field: "date", headerName: "Timestamp", flex: 2 },
-                        { field: "is_live", headerName: "Source", flex: 2,
-                          valueFormatter: p => p.value ? "PayPal Sandbox (Live)" : "Synthetic Demo",
-                          cellStyle: p => p.value ? { 'color': '#10b981', 'fontWeight': 'bold' } : { 'color': '#64748b', 'fontStyle': 'italic' }
-                        }
-                    ],
-                    rowData: [],
-                    defaultColDef: { resizable: true }
-                });
-                console.log("[grid] created successfully:", !!spendGridApi);
-            } catch (err) {
-                console.error("[grid] CREATION FAILED:", err);
+                data = await response.json();
+            } catch (error) {
+                throw new Error(`Invalid response from ${url}`);
+            }
+            if (!response.ok) throw new Error(data.error || `Request failed (HTTP ${response.status})`);
+            return data;
+        }
+
+        function promptAdminToken() {
+            const token = window.prompt("Enter the admin token. It is sent with this request only and is not stored.");
+            return token === null || token.trim() === "" ? null : token.trim();
+        }
+
+        function adminHeaders(token) {
+            return { "X-Admin-Token": token };
+        }
+
+        function statusBadgeRenderer(params) {
+            const badge = document.createElement("span");
+            const status = String(params.value || "UNKNOWN").toUpperCase();
+            badge.className = `status-badge ${status === "COMPLETED" ? "status-completed" : status === "DECLINED" ? "status-declined" : "status-other"}`;
+            badge.textContent = status;
+            return badge;
+        }
+
+        function sourceBadgeRenderer(params) {
+            const badge = document.createElement("span");
+            const isLive = params.data.is_live === true;
+            badge.className = `source-badge ${isLive ? "source-live" : "source-synthetic"}`;
+            badge.textContent = isLive ? "PayPal Sandbox" : "Synthetic";
+            return badge;
+        }
+
+        function initializeGrid() {
+            const gridDiv = document.querySelector("#spendGrid");
+            if (!window.agGrid || !gridDiv) {
+                document.getElementById("transactions-status").textContent = "Transaction table could not be initialized.";
+                return;
+            }
+            spendGridApi = agGrid.createGrid(gridDiv, {
+                columnDefs: [
+                    { field: "id", headerName: "Capture ID", minWidth: 150, flex: 1.4 },
+                    { field: "amount_minor", headerName: "Amount", minWidth: 115, flex: 1, valueFormatter: p => formatMinorCurrency(p.value, p.data.currency) },
+                    { field: "status", headerName: "Status", minWidth: 125, flex: 1, cellRenderer: statusBadgeRenderer },
+                    { field: "date", headerName: "Timestamp", minWidth: 185, flex: 1.5 },
+                    { field: "is_live", headerName: "Source", minWidth: 145, flex: 1, cellDataType: "text",
+                      valueGetter: p => p.data.is_live === true ? "PayPal Sandbox (Live)" : "Synthetic Demo",
+                      cellRenderer: sourceBadgeRenderer }
+                ],
+                rowData: [],
+                defaultColDef: { resizable: true, sortable: true },
+                animateRows: true,
+                getRowId: params => params.data.id
+            });
+        }
+
+        async function refreshTransactions() {
+            const status = document.getElementById("transactions-status");
+            try {
+                const transactions = await apiJSON("/api/transactions");
+                allTransactions = Array.isArray(transactions) ? transactions : [];
+                applyFilter();
+                status.textContent = "";
+            } catch (error) {
+                console.error("[transactions]", error);
+                status.textContent = `Transactions unavailable: ${error.message}`;
+            }
+        }
+
+        async function refreshSpendIntelligence() {
+            try {
+                const intel = await apiJSON("/api/spend-intelligence");
+                document.getElementById("ai-insight").textContent = intel.ai_insight || "AI insight unavailable.";
+                document.getElementById("ai-insight-citations").textContent = (intel.ai_insight_citations || [])
+                    .map(citation => `Order ${citation.order_id} · Capture ${citation.capture_id}`).join("  |  ");
+                document.getElementById("total-revenue").textContent = formatMinorCurrency(intel.total_captured_minor, 'USD');
+                document.getElementById("total-success").textContent = intel.live_success || 0;
+                document.getElementById("demo-success").textContent = intel.demo_completed_count || 0;
+                document.getElementById("decline-rate").textContent = intel.decline_rate_available
+                    ? `${Number(intel.decline_rate_percent).toFixed(1)}%`
+                    : "No data yet";
+            } catch (error) {
+                console.error("[spend intelligence]", error);
+                document.getElementById("ai-insight").textContent = `AI spend insight unavailable: ${error.message}`;
+            }
+        }
+
+        async function refreshLeakageScore() {
+            const score = await apiJSON("/api/findings/leakage-score");
+            document.getElementById("leakage-lost").textContent = formatMinorCurrency(score.lost_minor, "USD");
+            document.getElementById("leakage-recoverable").textContent = formatMinorCurrency(score.recoverable_minor, "USD");
+            document.getElementById("leakage-recovered").textContent = formatMinorCurrency(score.recovered_minor, "USD");
+            document.getElementById("simulated-leakage-lost").textContent = formatMinorCurrency(score.simulated_lost_minor, "USD");
+            document.getElementById("simulated-leakage-recoverable").textContent = formatMinorCurrency(score.simulated_recoverable_minor, "USD");
+            document.getElementById("simulated-leakage-recovered").textContent = formatMinorCurrency(score.simulated_recovered_minor, "USD");
+        }
+
+        function addFindingText(parent, tag, className, text) {
+            const element = document.createElement(tag);
+            element.className = className;
+            element.textContent = text;
+            parent.appendChild(element);
+            return element;
+        }
+
+        function renderFindings(findings) {
+            const list = document.getElementById("findings-list");
+            list.replaceChildren();
+            const activeFindings = findings.filter(finding => finding.status === "open" || finding.status === "acknowledged");
+            if (activeFindings.length === 0) {
+                addFindingText(list, "p", "rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-5 text-sm font-medium text-emerald-800", "✓ All clear — no active findings.");
+                return;
             }
 
-            setTimeout(refreshDashboard, 100);
-
-            const urlParams = new URLSearchParams(window.location.search);
-            if (urlParams.has('success') && urlParams.has('token')) {
-                captureOrder(urlParams.get('token'));
+            for (const finding of activeFindings) {
+                const card = document.createElement("article");
+                card.className = "flex flex-col gap-4 rounded-xl border border-amber-200 bg-amber-50/60 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5";
+                const details = document.createElement("div");
+                details.className = "flex min-w-0 items-start gap-3";
+                const icon = document.createElement("span");
+                icon.className = "mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-100 text-lg text-amber-700";
+                icon.setAttribute("aria-hidden", "true");
+                icon.textContent = "⚠";
+                details.appendChild(icon);
+                const copy = document.createElement("div");
+                copy.className = "min-w-0";
+                addFindingText(copy, "h3", "font-bold capitalize text-slate-900", String(finding.detector || "Finding").replaceAll("_", " "));
+                addFindingText(copy, "p", "mt-1 text-lg font-bold text-slate-900", formatMinorCurrency(finding.amount_minor, finding.currency || "USD"));
+                addFindingText(copy, "p", "mt-1 text-sm leading-5 text-slate-500", finding.explanation || "Potential revenue leakage detected.");
+                if (finding.evidence && finding.evidence.is_synthetic) {
+                    addFindingText(copy, "span", "mt-2 inline-flex rounded-full bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800", "Synthetic Demo");
+                }
+                details.appendChild(copy);
+                const action = document.createElement("div");
+                action.className = "flex shrink-0 flex-col gap-2 sm:items-end";
+                const button = document.createElement("button");
+                button.className = "action-button w-full bg-blue-700 text-white hover:bg-blue-800 sm:w-auto";
+                button.type = "button";
+                button.textContent = "Approve Refund";
+                button.addEventListener("click", () => approveFinding(finding.id, button));
+                action.appendChild(button);
+                const feedback = document.createElement("span");
+                feedback.className = "text-xs text-slate-500";
+                feedback.setAttribute("aria-live", "polite");
+                action.appendChild(feedback);
+                card.append(details, action);
+                list.appendChild(card);
             }
-        });
+        }
+
+        async function refreshFindingsDashboard() {
+            const status = document.getElementById("findings-status");
+            try {
+                const [score, findings] = await Promise.all([
+                    apiJSON("/api/findings/leakage-score"),
+                    apiJSON("/api/findings")
+                ]);
+                document.getElementById("leakage-lost").textContent = formatMinorCurrency(score.lost_minor, "USD");
+                document.getElementById("leakage-recoverable").textContent = formatMinorCurrency(score.recoverable_minor, "USD");
+                document.getElementById("leakage-recovered").textContent = formatMinorCurrency(score.recovered_minor, "USD");
+                document.getElementById("simulated-leakage-lost").textContent = formatMinorCurrency(score.simulated_lost_minor, "USD");
+                document.getElementById("simulated-leakage-recoverable").textContent = formatMinorCurrency(score.simulated_recoverable_minor, "USD");
+                document.getElementById("simulated-leakage-recovered").textContent = formatMinorCurrency(score.simulated_recovered_minor, "USD");
+                renderFindings(Array.isArray(findings) ? findings : []);
+                status.textContent = "";
+            } catch (error) {
+                console.error("[findings]", error);
+                status.textContent = `Findings unavailable: ${error.message}`;
+                document.getElementById("findings-list").textContent = "Could not load active findings.";
+            }
+        }
 
         async function refreshDashboard() {
-            try {
-                const txRes = await fetch('/api/transactions');
-                if (!txRes.ok) throw new Error("HTTP " + txRes.status);
-                const txData = await txRes.json();
-                console.log("[transactions] loaded", txData.length, "rows:", txData);
-                window.allTransactions = txData;
-                applyFilter();
-            } catch (err) {
-                console.error("[transactions] FAILED:", err);
-                document.getElementById('ai-insight').innerText = "❌ Transactions failed: " + err.message;
-            }
-
-            try {
-                const intelRes = await fetch('/api/spend-intelligence');
-                if (!intelRes.ok) throw new Error("HTTP " + intelRes.status);
-                const intel = await intelRes.json();
-                document.getElementById('ai-insight').innerText = "🤖 " + intel.ai_insight;
-                document.getElementById('total-revenue').innerText = '$' + (intel.total_captured || 0).toFixed(2);
-                document.getElementById('total-success').innerText = intel.live_success || 0;
-                document.getElementById('demo-success').innerText = intel.demo_completed_count || 0;
-            } catch (err) {
-                console.error("[metrics] FAILED:", err);
-                document.getElementById('ai-insight').innerText = "⚠️ AI metrics unavailable (grid still works)";
-            }
+            await Promise.all([refreshTransactions(), refreshSpendIntelligence(), refreshFindingsDashboard()]);
         }
 
         function applyFilter() {
-            if (!spendGridApi) {
-                console.error("[filter] spendGridApi is null — cannot set rowData");
+            if (!spendGridApi) return;
+            const filter = document.getElementById("source-filter").value;
+            let filteredData = allTransactions;
+            if (filter === "live") filteredData = filteredData.filter(record => record.is_live === true);
+            if (filter === "demo") filteredData = filteredData.filter(record => record.is_live === false);
+            spendGridApi.setGridOption("rowData", filteredData);
+        }
+
+        async function seedDemoFinding() {
+            const button = document.getElementById("seed-demo-btn");
+            const status = document.getElementById("findings-status");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                status.textContent = "Admin token is required to seed a demo finding.";
                 return;
             }
-            const filter = document.getElementById('source-filter').value;
-            let filteredData = window.allTransactions || [];
-            if (filter === 'live') filteredData = filteredData.filter(r => r.is_live === true);
-            else if (filter === 'demo') filteredData = filteredData.filter(r => r.is_live === false);
-            console.log("[filter]", filter, "→", filteredData.length, "rows");
-            spendGridApi.setGridOption('rowData', filteredData);
+            button.disabled = true;
+            status.textContent = "Seeding a simulated finding…";
+            try {
+                const result = await apiJSON("/api/findings/seed-demo", {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
+                status.textContent = result.created
+                    ? "Synthetic demo leak added. No PayPal transaction was made."
+                    : `Synthetic demo finding already exists (${result.finding.status}).`;
+                await refreshFindingsDashboard();
+            } catch (error) {
+                console.error("[seed demo]", error);
+                status.textContent = `Could not seed demo leak: ${error.message}`;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function runAudit() {
+            const button = document.getElementById("run-audit-btn");
+            const status = document.getElementById("findings-status");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                status.textContent = "Admin token is required to run an audit.";
+                return;
+            }
+            button.disabled = true;
+            status.textContent = "Scanning payment activity…";
+            try {
+                const result = await apiJSON("/api/findings/detect", {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
+                status.textContent = `Audit complete. ${result.findings_detected} finding${result.findings_detected === 1 ? "" : "s"} detected.`;
+                await refreshFindingsDashboard();
+            } catch (error) {
+                console.error("[audit]", error);
+                status.textContent = `Audit failed: ${error.message}`;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function approveFinding(findingID, button) {
+            const feedback = button.parentElement.querySelector("[aria-live]");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                feedback.textContent = "Admin token is required to record approval.";
+                return;
+            }
+            button.disabled = true;
+            feedback.textContent = "Recording approval…";
+            try {
+                const action = await apiJSON(`/api/findings/${encodeURIComponent(findingID)}/action`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
+                    body: JSON.stringify({ action_type: "record_refund", description: "Demo refund approval recorded; no money moved." })
+                });
+                if (action.money_moved !== false) throw new Error("Safety check failed: proposal reports money moved.");
+                const approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
+                if (approved.money_moved !== false) throw new Error("Safety check failed: approval reports money moved.");
+                document.getElementById("findings-status").textContent = "Approval recorded. No refund was sent and no money moved.";
+                await refreshFindingsDashboard();
+            } catch (error) {
+                console.error("[approve finding]", error);
+                feedback.textContent = error.message;
+                button.disabled = false;
+            }
         }
 
         function openReviewModal() {
-            document.getElementById('order-review-modal').style.display = 'flex';
+            document.getElementById("order-review-modal").classList.add("is-open");
+            document.getElementById("cancel-review-btn").focus();
         }
 
         function closeReviewModal() {
-            document.getElementById('order-review-modal').style.display = 'none';
+            document.getElementById("order-review-modal").classList.remove("is-open");
+            document.getElementById("paypal-btn").focus();
         }
 
         async function startCheckout() {
             closeReviewModal();
-            const btn = document.getElementById('paypal-btn');
-            btn.disabled = true; btn.innerText = "Redirecting...";
+            const button = document.getElementById("paypal-btn");
+            button.disabled = true;
+            button.textContent = "Redirecting to PayPal…";
             try {
-                const res = await fetch('/api/create-order', { method: 'POST' });
-                if (!res.ok) throw new Error("Server error creating order");
-                const data = await res.json();
-                if (data.error) throw new Error(data.error);
-                window.location.href = data.approveURL;
-            } catch (err) {
-                alert("Error: " + err.message);
-                btn.disabled = false; btn.innerText = "PayPal";
+                const order = await apiJSON("/api/create-order", { method: "POST" });
+                if (!order.approveURL) throw new Error("PayPal approval URL was not returned.");
+                window.location.href = order.approveURL;
+            } catch (error) {
+                console.error("[checkout]", error);
+                document.getElementById("findings-status").textContent = `Could not start checkout: ${error.message}`;
+                button.disabled = false;
+                button.textContent = "Continue with PayPal →";
             }
         }
 
         async function captureOrder(orderID) {
-            document.getElementById('ai-insight').innerText = "🤖 Verifying and capturing payment...";
+            document.getElementById("ai-insight").textContent = "Verifying and capturing your Sandbox payment…";
             try {
-                const res = await fetch('/api/capture-order', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ orderID: orderID })
+                const result = await apiJSON("/api/capture-order", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ orderID })
                 });
-                let data;
-                try { data = await res.json(); } catch (e) { throw new Error("Server returned invalid response"); }
-                if (data.status === "capture_succeeded_persistence_pending") {
-                    alert(`⚠️ Payment captured at PayPal (ID: ${data.capture_id}, $${data.amount})\n\nBut saving to our database failed. Please refresh or retry. Reference: ${data.correlation_id}`);
-                    window.history.replaceState({}, document.title, "/");
-                    return;
+                if (result.status === "capture_succeeded_persistence_pending") {
+                    document.getElementById("ai-insight").textContent = `Payment captured at PayPal (${result.capture_id}), but saving it failed. Reference: ${result.correlation_id}`;
+                } else {
+                    document.getElementById("ai-insight").textContent = `Payment captured successfully. Capture ID: ${result.id}.`;
                 }
-                if (!res.ok || data.error) throw new Error(data.error || "Unknown error");
-                alert(`✅ Payment Captured! ID: ${data.id} for $${data.amount}`);
+            } catch (error) {
+                console.error("[capture]", error);
+                document.getElementById("ai-insight").textContent = `Payment capture failed: ${error.message}`;
+            } finally {
                 window.history.replaceState({}, document.title, "/");
-                refreshDashboard();
-            } catch (err) {
-                alert("Capture Error: " + err.message);
-                window.history.replaceState({}, document.title, "/");
-                refreshDashboard();
+                await refreshDashboard();
             }
         }
+
+        document.getElementById("seed-demo-btn").addEventListener("click", seedDemoFinding);
+        document.getElementById("run-audit-btn").addEventListener("click", runAudit);
+        document.getElementById("source-filter").addEventListener("change", applyFilter);
+        document.getElementById("paypal-btn").addEventListener("click", openReviewModal);
+        document.getElementById("cancel-review-btn").addEventListener("click", closeReviewModal);
+        document.getElementById("continue-to-paypal-btn").addEventListener("click", startCheckout);
+        document.getElementById("order-review-modal").addEventListener("click", event => {
+            if (event.target.id === "order-review-modal") closeReviewModal();
+        });
+
+        document.addEventListener("DOMContentLoaded", async () => {
+            initializeGrid();
+            const params = new URLSearchParams(window.location.search);
+            const orderID = params.get("token");
+            if (params.has("success") && orderID) await captureOrder(orderID);
+            else await refreshDashboard();
+        });
     </script>
 </body>
 </html>

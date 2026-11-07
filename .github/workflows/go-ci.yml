@@ -2,7 +2,7 @@ name: Go CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
     branches: [main]
 
@@ -18,6 +18,22 @@ jobs:
     name: Format, vet, race tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      PAYPAL_AI_AUDITOR_TEST_DATABASE_URL: postgres://test:test@localhost:5432/paypal_ai_auditor_test?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: paypal_ai_auditor_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d paypal_ai_auditor_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout
@@ -28,6 +44,22 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Prepare disposable migration baseline
+        env:
+          DATABASE_URL: ${{ env.PAYPAL_AI_AUDITOR_TEST_DATABASE_URL }}
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE TABLE captures (id TEXT PRIMARY KEY, amount DOUBLE PRECISION NOT NULL, status TEXT NOT NULL, currency TEXT NOT NULL, date TEXT NOT NULL, is_live BOOLEAN NOT NULL)"
+
+      - name: Apply additive migrations to CI database
+        env:
+          DATABASE_URL: ${{ env.PAYPAL_AI_AUDITOR_TEST_DATABASE_URL }}
+        run: |
+          go run ./cmd/migrate ./migrations/001_amount_minor.sql
+          go run ./cmd/migrate ./migrations/002_attempts.sql
+          go run ./cmd/migrate ./migrations/003_webhook_events.sql
+          go run ./cmd/migrate ./migrations/004_findings_actions.sql
+          go run ./cmd/migrate ./migrations/005_action_money_moved_check.sql
 
       - name: Verify gofmt
         run: |
@@ -42,4 +74,4 @@ jobs:
         run: go vet ./...
 
       - name: go test (-race)
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -v ./...
