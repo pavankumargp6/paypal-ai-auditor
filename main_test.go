@@ -244,6 +244,16 @@ func TestAPIRouteAuthenticationScopes(t *testing.T) {
 	}
 }
 
+func TestWebhookActivityEndpointIsReadOnly(t *testing.T) {
+	handler := makeWebhookActivityHandler()
+	request := httptest.NewRequest(http.MethodPost, "/api/webhook-activity", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("POST webhook activity response=%d Allow=%q, want 405 and GET", response.Code, response.Header().Get("Allow"))
+	}
+}
+
 func TestAuditReportsMoneyMoved(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -647,3 +647,69 @@ func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {
 		t.Fatalf("real attempt evidence = %+v, want fixture order/capture", evidence)
 	}
 }
+
+func TestPostgresWebhookActivitySummaryOmitsPayload(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	readActivity := func() (webhookActivityResponse, *httptest.ResponseRecorder) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, "/api/webhook-activity", nil)
+		response := httptest.NewRecorder()
+		makeWebhookActivityHandler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("webhook activity response=%d %s, want 200", response.Code, response.Body.String())
+		}
+		var activity webhookActivityResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &activity); err != nil {
+			t.Fatalf("decode webhook activity response: %v", err)
+		}
+		return activity, response
+	}
+	baseline, _ := readActivity()
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	eventIDs := []string{"WH-ACTIVITY-OLD-" + suffix, "WH-ACTIVITY-DONE-" + suffix, "WH-ACTIVITY-ERR-" + suffix}
+	receivedAt := time.Now().UTC().Truncate(time.Microsecond).Add(time.Hour)
+	payload := `{"id":"` + eventIDs[2] + `","event_type":"WEBHOOK.ACTIVITY.TEST","payer":{"email_address":"private-payer@example.test","marker":"DO_NOT_EXPOSE"}}`
+	for i, eventID := range eventIDs {
+		var processedAt any
+		processError := ""
+		if i == 1 {
+			processedAt = receivedAt.Add(time.Minute)
+		}
+		if i == 2 {
+			processError = "private processing error detail"
+		}
+		if _, err := testDB.ExecContext(ctx, `INSERT INTO webhook_events
+			(event_id, event_type, payload, received_at, processed_at, process_error)
+			VALUES ($1, $2, $3::jsonb, $4, $5, NULLIF($6, ''))`,
+			eventID, []string{"WEBHOOK.ACTIVITY.OLD", "WEBHOOK.ACTIVITY.DONE", "WEBHOOK.ACTIVITY.LATEST"}[i],
+			payload, receivedAt.Add(time.Duration(i)*time.Minute), processedAt, processError); err != nil {
+			t.Fatalf("insert webhook activity fixture: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, eventID := range eventIDs {
+			_, _ = testDB.ExecContext(context.Background(), `DELETE FROM webhook_events WHERE event_id = $1`, eventID)
+		}
+	})
+
+	activity, response := readActivity()
+	if activity.ReceivedCount != baseline.ReceivedCount+3 ||
+		activity.ProcessedCount != baseline.ProcessedCount+1 ||
+		activity.ProcessingErrorCount != baseline.ProcessingErrorCount+1 {
+		t.Fatalf("activity counts=%+v baseline=%+v, want +3 received, +1 processed, +1 error", activity, baseline)
+	}
+	if activity.LastEventType != "WEBHOOK.ACTIVITY.LATEST" || activity.LastEventAt == nil ||
+		!activity.LastEventAt.Equal(receivedAt.Add(2*time.Minute)) {
+		t.Fatalf("last event type/time=%q/%v, want latest fixture %v", activity.LastEventType, activity.LastEventAt, receivedAt.Add(2*time.Minute))
+	}
+	if strings.Contains(response.Body.String(), "payer") ||
+		strings.Contains(response.Body.String(), "DO_NOT_EXPOSE") ||
+		strings.Contains(response.Body.String(), "private processing error detail") ||
+		strings.Contains(response.Body.String(), eventIDs[2]) {
+		t.Fatalf("webhook activity response exposed payload or event-specific data: %s", response.Body.String())
+	}
+}
