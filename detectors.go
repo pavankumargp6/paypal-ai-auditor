@@ -70,18 +70,22 @@ func detectDuplicateCaptures(observations []captureObservation) []findingDraft {
 		if len(rows) < 2 {
 			continue
 		}
+		evidence := map[string]any{
+			"reason":                "capture_id_persisted_multiple_times",
+			"capture_ids":           []string{captureID},
+			"persisted_count":       len(rows),
+			"amount_minor":          rows[0].AmountMinor,
+			"monetary_excess_known": false,
+		}
+		if orderID := duplicateCaptureOrderID(rows); orderID != "" {
+			evidence["paypal_order_id"] = orderID
+		}
 		findings = append(findings, findingDraft{
 			Fingerprint: "duplicate_capture:capture:" + fingerprintToken(captureID),
 			Detector:    "duplicate_capture",
 			AmountMinor: 0,
 			Currency:    validFindingCurrency(rows[0].Currency),
-			Evidence: map[string]any{
-				"reason":                "capture_id_persisted_multiple_times",
-				"capture_ids":           []string{captureID},
-				"persisted_count":       len(rows),
-				"amount_minor":          rows[0].AmountMinor,
-				"monetary_excess_known": false,
-			},
+			Evidence:    evidence,
 		})
 	}
 
@@ -128,6 +132,15 @@ func detectDuplicateCaptures(observations []captureObservation) []findingDraft {
 		})
 	}
 	return findings
+}
+
+func duplicateCaptureOrderID(rows []captureObservation) string {
+	for _, row := range rows {
+		if orderID := strings.TrimSpace(row.OrderID); orderID != "" {
+			return orderID
+		}
+	}
+	return ""
 }
 
 func detectFeeMismatch(amountMinor, actualFeeMinor int64, currency string) (expected int64, delta int64, mismatch bool) {
@@ -220,10 +233,21 @@ func runDeterministicDetectors(ctx context.Context, targetDB *sql.DB) ([]finding
 	if targetDB == nil {
 		return nil, errors.New("database unavailable")
 	}
-	rows, err := targetDB.QueryContext(ctx, `SELECT paypal_order_id, capture_id, amount_minor, currency, outcome, stage, created_at
-		FROM attempts
-		WHERE is_synthetic = FALSE AND capture_id IS NOT NULL
-		  AND stage IN ('capture', 'webhook')`)
+	rows, err := targetDB.QueryContext(ctx, `SELECT COALESCE(NULLIF(a.paypal_order_id, ''), related.paypal_order_id, ''),
+		a.capture_id, a.amount_minor, a.currency, a.outcome, a.stage, a.created_at
+		FROM attempts a
+		LEFT JOIN LATERAL (
+			SELECT candidate.paypal_order_id
+			FROM attempts candidate
+			WHERE candidate.capture_id = a.capture_id
+			  AND candidate.paypal_order_id IS NOT NULL AND candidate.paypal_order_id <> ''
+			  AND candidate.is_synthetic = FALSE
+			  AND candidate.stage IN ('capture', 'webhook')
+			ORDER BY candidate.created_at DESC, candidate.id DESC
+			LIMIT 1
+		) related ON TRUE
+		WHERE a.is_synthetic = FALSE AND a.capture_id IS NOT NULL
+		  AND a.stage IN ('capture', 'webhook')`)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,27 @@ Updated: 2026-11-07
 Repository: `C:\dev\paypal-ai-auditor`
 Branch: `feat/revenue-guardian`
 
+## Current authorized fixes (2026-11-07)
+
+This section supersedes earlier verification and gap statements below.
+
+- Refused action approval with HTTP 409 and a clear message when the stored action audit contains `money_moved=true`; added unit coverage and retained/updated the PostgreSQL integration test to assert the unsafe row remains unchanged.
+- Added `ADMIN_TOKEN` authentication using `crypto/subtle` for payment writes, finding detection/seeding/action proposals, and approvals. An unset token fails closed. The browser asks for the token per operation and neither persists nor logs it. `.env.example` and README document the setting.
+- Repeated-persisted-capture findings resolve an available PayPal order ID through related attempts; unit and PostgreSQL integration coverage assert the evidence.
+- Added `.gitattributes` (`*.go text eol=lf`) and normalized tracked Go files.
+- Added additive migration 005, `migrations/005_action_money_moved_check.sql`, and included it in disposable CI migrations. Its SQL is documented in README. No production migration was run. Application code enforces the approval guard without migration 005; migration 004 is required before findings/action database routes work, while 005 adds the database-level guard.
+- README now documents token-authenticated writes, unauthenticated reads, the corrected evidence claims, all five migrations and exact PowerShell runner commands, and the limitations.
+- Local checks: `gofmt -l .` printed no files; `go vet ./...` exited successfully; `go test -race -count=1 -v ./...` passed. The eight PostgreSQL integration tests skipped locally because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` was intentionally unset; no database was accessed.
+- CI for this change, commit, and push are pending. Do not merge until the branch CI run is green and all PostgreSQL integration tests report PASS.
+
+### Pull request description
+
+**Title:** Secure PayPal Sandbox revenue-leakage review and add action audit guard
+
+**Summary:** Refuse approval of unsafe stored action audits, require an administrator token for state-changing endpoints, include available order IDs in repeated-capture evidence, and add an additive database check. Update the UI, migration workflow, and documentation. No refunds or other money movement are performed by action approval.
+
+**Deployment notes:** The requester reports migrations 001–003 are already applied in production; this was not independently checked. Apply migration 004 before deploying/relying on findings and action routes. Migration 005 adds a database-level audit safeguard; the application-level approval guard is enforced without it, but applying 005 is recommended. Set `APP_BASE_URL` and `PAYPAL_WEBHOOK_ID` in Render. No production database or Render settings were changed. Obtain approval before applying any production migration.
+
 ## Pre-submission verification (2026-11-07)
 
 - The initial worktree was clean at `86bfe14` but one commit behind `origin/feat/revenue-guardian`. It was fast-forwarded to `54aa758` (`Revamp spend intelligence dashboard UI`); that source commit matched the remote and the worktree was clean before documentation edits.

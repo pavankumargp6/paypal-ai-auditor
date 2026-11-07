@@ -220,6 +220,15 @@
             return data;
         }
 
+        function promptAdminToken() {
+            const token = window.prompt("Enter the admin token. It is sent with this request only and is not stored.");
+            return token === null || token.trim() === "" ? null : token.trim();
+        }
+
+        function adminHeaders(token) {
+            return { "X-Admin-Token": token };
+        }
+
         function statusBadgeRenderer(params) {
             const badge = document.createElement("span");
             const status = String(params.value || "UNKNOWN").toUpperCase();
@@ -391,10 +400,18 @@
         async function seedDemoFinding() {
             const button = document.getElementById("seed-demo-btn");
             const status = document.getElementById("findings-status");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                status.textContent = "Admin token is required to seed a demo finding.";
+                return;
+            }
             button.disabled = true;
             status.textContent = "Seeding a simulated finding…";
             try {
-                const result = await apiJSON("/api/findings/seed-demo", { method: "POST" });
+                const result = await apiJSON("/api/findings/seed-demo", {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
                 status.textContent = result.created
                     ? "Synthetic demo leak added. No PayPal transaction was made."
                     : `Synthetic demo finding already exists (${result.finding.status}).`;
@@ -410,10 +427,18 @@
         async function runAudit() {
             const button = document.getElementById("run-audit-btn");
             const status = document.getElementById("findings-status");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                status.textContent = "Admin token is required to run an audit.";
+                return;
+            }
             button.disabled = true;
             status.textContent = "Scanning payment activity…";
             try {
-                const result = await apiJSON("/api/findings/detect", { method: "POST" });
+                const result = await apiJSON("/api/findings/detect", {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
                 status.textContent = `Audit complete. ${result.findings_detected} finding${result.findings_detected === 1 ? "" : "s"} detected.`;
                 await refreshFindingsDashboard();
             } catch (error) {
@@ -426,16 +451,24 @@
 
         async function approveFinding(findingID, button) {
             const feedback = button.parentElement.querySelector("[aria-live]");
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                feedback.textContent = "Admin token is required to record approval.";
+                return;
+            }
             button.disabled = true;
             feedback.textContent = "Recording approval…";
             try {
                 const action = await apiJSON(`/api/findings/${encodeURIComponent(findingID)}/action`, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
                     body: JSON.stringify({ action_type: "record_refund", description: "Demo refund approval recorded; no money moved." })
                 });
                 if (action.money_moved !== false) throw new Error("Safety check failed: proposal reports money moved.");
-                const approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, { method: "POST" });
+                const approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
                 if (approved.money_moved !== false) throw new Error("Safety check failed: approval reports money moved.");
                 document.getElementById("findings-status").textContent = "Approval recorded. No refund was sent and no money moved.";
                 await refreshFindingsDashboard();
@@ -459,10 +492,15 @@
         async function startCheckout() {
             closeReviewModal();
             const button = document.getElementById("paypal-btn");
+            const adminToken = promptAdminToken();
+            if (!adminToken) return;
             button.disabled = true;
             button.textContent = "Redirecting to PayPal…";
             try {
-                const order = await apiJSON("/api/create-order", { method: "POST" });
+                const order = await apiJSON("/api/create-order", {
+                    method: "POST",
+                    headers: adminHeaders(adminToken)
+                });
                 if (!order.approveURL) throw new Error("PayPal approval URL was not returned.");
                 window.location.href = order.approveURL;
             } catch (error) {
@@ -474,11 +512,16 @@
         }
 
         async function captureOrder(orderID) {
+            const adminToken = promptAdminToken();
+            if (!adminToken) {
+                document.getElementById("ai-insight").textContent = "Admin token is required to capture the Sandbox payment.";
+                return;
+            }
             document.getElementById("ai-insight").textContent = "Verifying and capturing your Sandbox payment…";
             try {
                 const result = await apiJSON("/api/capture-order", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
                     body: JSON.stringify({ orderID })
                 });
                 if (result.status === "capture_succeeded_persistence_pending") {

@@ -344,7 +344,7 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	}{
 		{orderID, capture1, "succeeded", "capture"},
 		{orderID, capture2, "succeeded", "capture"},
-		{"DETECT-REPEATED-" + suffix, repeatedID, "failed", "capture"},
+		{"", repeatedID, "failed", "capture"},
 		{"DETECT-REPEATED-" + suffix, repeatedID, "succeeded", "webhook"},
 	} {
 		if _, err := testDB.ExecContext(ctx, `INSERT INTO attempts
@@ -372,6 +372,20 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 			t.Fatalf("detector did not persist finding %s (drafts=%d): %v", key, len(drafts), err)
 		}
 	}
+	var repeatedEvidence []byte
+	if err := testDB.QueryRowContext(ctx, `SELECT evidence FROM findings WHERE fingerprint = $1`,
+		"duplicate_capture:capture:"+fingerprintToken(repeatedID)).Scan(&repeatedEvidence); err != nil {
+		t.Fatalf("read repeated-capture evidence: %v", err)
+	}
+	var repeatedFindingEvidence struct {
+		PayPalOrderID string `json:"paypal_order_id"`
+	}
+	if err := json.Unmarshal(repeatedEvidence, &repeatedFindingEvidence); err != nil {
+		t.Fatalf("decode repeated-capture evidence: %v", err)
+	}
+	if repeatedFindingEvidence.PayPalOrderID != "DETECT-REPEATED-"+suffix {
+		t.Fatalf("repeated-capture evidence order ID=%q, want %q", repeatedFindingEvidence.PayPalOrderID, "DETECT-REPEATED-"+suffix)
+	}
 	var baseline leakageScore
 	if err := testDB.QueryRowContext(ctx, leakageScoreQuery).Scan(&baseline.LostMinor, &baseline.RecoverableMinor, &baseline.RecoveredMinor,
 		&baseline.SimulatedLostMinor, &baseline.SimulatedRecoverableMinor, &baseline.SimulatedRecoveredMinor); err != nil {
@@ -384,7 +398,8 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	}
 	proposal := httptest.NewRecorder()
 	proposalReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/findings/%d/action", findingID), strings.NewReader(`{"action_type":"record_recovery","description":"Record operator-confirmed recovery"}`))
-	makeFindingActionHandler().ServeHTTP(proposal, proposalReq)
+	proposalReq.Header.Set("X-Admin-Token", testAdminToken)
+	makeFindingActionHandler(testAdminToken).ServeHTTP(proposal, proposalReq)
 	if proposal.Code != http.StatusCreated {
 		t.Fatalf("propose action response=%d %s, want 201", proposal.Code, proposal.Body.String())
 	}
@@ -397,7 +412,8 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	}
 	approval := httptest.NewRecorder()
 	approvalReq := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", proposed.ID), nil)
-	makeApproveActionHandler().ServeHTTP(approval, approvalReq)
+	approvalReq.Header.Set("X-Admin-Token", testAdminToken)
+	makeApproveActionHandler(testAdminToken).ServeHTTP(approval, approvalReq)
 	if approval.Code != http.StatusOK {
 		t.Fatalf("approve action response=%d %s, want 200", approval.Code, approval.Body.String())
 	}
@@ -448,10 +464,14 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 		t.Fatalf("insert unsafe action fixture: %v", err)
 	}
 	unsafeApproveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", unsafeActionID), nil)
+	unsafeApproveRequest.Header.Set("X-Admin-Token", testAdminToken)
 	unsafeApproveResponse := httptest.NewRecorder()
-	makeApproveActionHandler().ServeHTTP(unsafeApproveResponse, unsafeApproveRequest)
+	makeApproveActionHandler(testAdminToken).ServeHTTP(unsafeApproveResponse, unsafeApproveRequest)
 	if unsafeApproveResponse.Code != http.StatusConflict {
 		t.Fatalf("unsafe action approval status=%d body=%s, want 409", unsafeApproveResponse.Code, unsafeApproveResponse.Body.String())
+	}
+	if !strings.Contains(unsafeApproveResponse.Body.String(), "Action audit reports money moved") {
+		t.Fatalf("unsafe action approval error=%s, want clear money-moved refusal", unsafeApproveResponse.Body.String())
 	}
 	var unsafeStatus, unsafeFindingStatus string
 	if err := testDB.QueryRowContext(ctx, `SELECT status, (SELECT status FROM findings WHERE id = $2) FROM actions WHERE id = $1`, unsafeActionID, unsafeFindingID).
@@ -460,6 +480,10 @@ func TestPostgresDetectorsAndActionAudit(t *testing.T) {
 	}
 	if unsafeStatus != "proposed" || unsafeFindingStatus != "open" {
 		t.Fatalf("unsafe approval changed state: action=%q finding=%q", unsafeStatus, unsafeFindingStatus)
+	}
+	_, err = testDB.ExecContext(ctx, `UPDATE actions SET status = 'executed' WHERE id = $1`, unsafeActionID)
+	if err == nil || !strings.Contains(err.Error(), "actions_no_money_moved_after_proposal_check") {
+		t.Fatalf("database allowed unsafe action transition or returned unexpected error: %v", err)
 	}
 }
 
@@ -478,8 +502,8 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	})
 
 	mux := http.NewServeMux()
-	registerFindingRoutes(mux)
-	mux.HandleFunc("/api/actions/", makeApproveActionHandler())
+	registerFindingRoutes(mux, testAdminToken)
+	mux.HandleFunc("/api/actions/", makeApproveActionHandler(testAdminToken))
 
 	requestScore := func(method string) leakageScore {
 		t.Helper()
@@ -501,6 +525,7 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	}
 
 	seedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
+	seedRequest.Header.Set("X-Admin-Token", testAdminToken)
 	seedResponse := httptest.NewRecorder()
 	mux.ServeHTTP(seedResponse, seedRequest)
 	if seedResponse.Code != http.StatusCreated {
@@ -524,6 +549,7 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	}
 
 	secondSeedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
+	secondSeedRequest.Header.Set("X-Admin-Token", testAdminToken)
 	secondSeedResponse := httptest.NewRecorder()
 	mux.ServeHTTP(secondSeedResponse, secondSeedRequest)
 	var secondSeed seedDemoResponse
@@ -539,6 +565,7 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	}
 
 	proposalRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/findings/%d/action", seeded.Finding.ID), strings.NewReader(`{"action_type":"record_recovery","description":"Demo action only"}`))
+	proposalRequest.Header.Set("X-Admin-Token", testAdminToken)
 	proposalResponse := httptest.NewRecorder()
 	mux.ServeHTTP(proposalResponse, proposalRequest)
 	var proposal actionResponse
@@ -546,6 +573,7 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 		t.Fatalf("demo action proposal response=%d %s", proposalResponse.Code, proposalResponse.Body.String())
 	}
 	approveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", proposal.ID), nil)
+	approveRequest.Header.Set("X-Admin-Token", testAdminToken)
 	approveResponse := httptest.NewRecorder()
 	mux.ServeHTTP(approveResponse, approveRequest)
 	if approveResponse.Code != http.StatusOK {

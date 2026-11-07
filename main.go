@@ -350,18 +350,19 @@ func main() {
 	clientID := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("PAYPAL_CLIENT_SECRET"))
 	groqKey := strings.TrimSpace(os.Getenv("GROQ_API_KEY"))
+	adminToken := strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
 	if clientID == "" || clientSecret == "" {
 		log.Fatal("PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET are required")
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
-	mux.HandleFunc("/api/create-order", makeCreateOrderHandler(clientID, clientSecret))
-	mux.HandleFunc("/api/capture-order", makeCaptureOrderHandler(clientID, clientSecret))
+	mux.Handle("/api/create-order", requireAdminToken(adminToken, makeCreateOrderHandler(clientID, clientSecret)))
+	mux.Handle("/api/capture-order", requireAdminToken(adminToken, makeCaptureOrderHandler(clientID, clientSecret)))
 	mux.HandleFunc("/api/spend-intelligence", makeSpendHandler(groqKey))
 	mux.HandleFunc("/api/transactions", makeTransactionsHandler())
-	registerFindingRoutes(mux)
-	mux.HandleFunc("/api/actions/", makeApproveActionHandler())
+	registerFindingRoutes(mux, adminToken)
+	mux.HandleFunc("/api/actions/", makeApproveActionHandler(adminToken))
 	webhookID := strings.TrimSpace(os.Getenv("PAYPAL_WEBHOOK_ID"))
 	mux.HandleFunc("/webhooks/paypal", makePayPalWebhookHandler(clientID, clientSecret, webhookID))
 

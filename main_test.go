@@ -21,6 +21,8 @@ import (
 
 type mockRoundTripper func(*http.Request) (*http.Response, error)
 
+const testAdminToken = "test-admin-token"
+
 func (m mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return m(req) }
 
 // readErrorBody simulates a response body whose Read always fails.
@@ -183,6 +185,61 @@ func TestMoneyFieldsUseIntegerMinorUnits(t *testing.T) {
 				t.Errorf("money field %s.%s uses float64", typ.Name(), field.Name)
 			}
 		}
+	}
+}
+
+func TestRequireAdminToken(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		provided   string
+		wantStatus int
+		wantCalled bool
+	}{
+		{name: "unset admin token fails closed", provided: testAdminToken, wantStatus: http.StatusServiceUnavailable},
+		{name: "missing token", configured: testAdminToken, wantStatus: http.StatusUnauthorized},
+		{name: "wrong token", configured: testAdminToken, provided: "wrong-token", wantStatus: http.StatusUnauthorized},
+		{name: "correct token", configured: testAdminToken, provided: testAdminToken, wantStatus: http.StatusNoContent, wantCalled: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			handler := requireAdminToken(test.configured, func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/api/test-write", nil)
+			if test.provided != "" {
+				request.Header.Set("X-Admin-Token", test.provided)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus || called != test.wantCalled {
+				t.Fatalf("status=%d called=%t, want status=%d called=%t", response.Code, called, test.wantStatus, test.wantCalled)
+			}
+		})
+	}
+}
+
+func TestAuditReportsMoneyMoved(t *testing.T) {
+	tests := []struct {
+		name    string
+		audit   string
+		want    bool
+		wantErr bool
+	}{
+		{name: "safe audit", audit: `{"money_moved":false,"events":[{"money_moved":false}]}`, want: false},
+		{name: "top-level unsafe audit", audit: `{"money_moved":true}`, want: true},
+		{name: "unsafe audit event", audit: `{"money_moved":false,"events":[{"money_moved":true}]}`, want: true},
+		{name: "malformed audit", audit: `{`, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := auditReportsMoneyMoved([]byte(test.audit))
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("auditReportsMoneyMoved() = %t, %v; want %t, error=%t", got, err, test.want, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -744,7 +801,7 @@ func TestDuplicateCaptureDetectorUsesCaptureEvidence(t *testing.T) {
 	observations := []captureObservation{
 		{OrderID: "ORDER-1", CaptureID: "CAP-1", AmountMinor: 2500, Currency: "USD", Outcome: "succeeded", Stage: "capture"},
 		{OrderID: "ORDER-1", CaptureID: "CAP-2", AmountMinor: 2500, Currency: "USD", Outcome: "succeeded", Stage: "webhook"},
-		{OrderID: "ORDER-2", CaptureID: "CAP-3", AmountMinor: 4000, Currency: "USD", Outcome: "failed", Stage: "capture"},
+		{CaptureID: "CAP-3", AmountMinor: 4000, Currency: "USD", Outcome: "failed", Stage: "capture"},
 		{OrderID: "ORDER-2", CaptureID: "CAP-3", AmountMinor: 4000, Currency: "USD", Outcome: "succeeded", Stage: "webhook"},
 	}
 	findings := detectDuplicateCaptures(observations)
@@ -768,7 +825,7 @@ func TestDuplicateCaptureDetectorUsesCaptureEvidence(t *testing.T) {
 			}
 		case strings.Contains(finding.Fingerprint, "duplicate_capture:capture:"):
 			sawID = true
-			if finding.AmountMinor != 0 || !strings.Contains(string(encoded), `"CAP-3"`) {
+			if finding.AmountMinor != 0 || !strings.Contains(string(encoded), `"CAP-3"`) || !strings.Contains(string(encoded), `"paypal_order_id":"ORDER-2"`) {
 				t.Fatalf("repeated capture ID evidence = %d/%s", finding.AmountMinor, encoded)
 			}
 		}
@@ -849,6 +906,28 @@ func TestFindingsActionsMigrationIsAdditiveAndHasStatusChecks(t *testing.T) {
 	}
 }
 
+func TestActionMoneyMovedConstraintMigration(t *testing.T) {
+	contents, err := os.ReadFile("migrations/005_action_money_moved_check.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlText := strings.ToLower(string(contents))
+	for _, fragment := range []string{
+		"alter table actions",
+		"actions_no_money_moved_after_proposal_check",
+		"status = 'proposed'",
+		"jsonb_path_exists(result, '$.**.money_moved ? (@ == true)')",
+		"not valid",
+	} {
+		if !strings.Contains(sqlText, fragment) {
+			t.Errorf("migration 005 missing %q", fragment)
+		}
+	}
+	if strings.Contains(sqlText, "drop table") || strings.Contains(sqlText, "drop constraint") {
+		t.Fatal("migration 005 must be additive")
+	}
+}
+
 func TestCIRunsFindingsActionsMigration(t *testing.T) {
 	contents, err := os.ReadFile(".github/workflows/go-ci.yml")
 	if err != nil {
@@ -856,6 +935,9 @@ func TestCIRunsFindingsActionsMigration(t *testing.T) {
 	}
 	if !strings.Contains(string(contents), "go run ./cmd/migrate ./migrations/004_findings_actions.sql") {
 		t.Fatal("CI workflow must apply migration 004 before PostgreSQL integration tests")
+	}
+	if !strings.Contains(string(contents), "go run ./cmd/migrate ./migrations/005_action_money_moved_check.sql") {
+		t.Fatal("CI workflow must apply migration 005 before PostgreSQL integration tests")
 	}
 }
 

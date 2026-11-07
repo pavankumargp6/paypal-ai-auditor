@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -40,17 +41,17 @@ type findingResponse struct {
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
-func registerFindingRoutes(mux *http.ServeMux) {
+func registerFindingRoutes(mux *http.ServeMux, adminToken string) {
 	mux.HandleFunc("/api/findings", makeFindingsHandler())
-	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler())
+	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler(adminToken))
 	mux.HandleFunc("/api/findings/leakage-score", makeLeakageScoreHandler())
-	mux.HandleFunc("/api/findings/seed-demo", makeSeedDemoFindingHandler())
-	mux.HandleFunc("/api/findings/", makeFindingActionHandler())
+	mux.HandleFunc("/api/findings/seed-demo", makeSeedDemoFindingHandler(adminToken))
+	mux.HandleFunc("/api/findings/", makeFindingActionHandler(adminToken))
 	mux.HandleFunc("/api/leakage-score", makeLeakageScoreHandler())
 }
 
-func makeDetectFindingsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeDetectFindingsHandler(adminToken string) http.HandlerFunc {
+	return requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -63,6 +64,21 @@ func makeDetectFindingsHandler() http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"detector": "deterministic", "findings_detected": len(drafts)})
+	})
+}
+
+func requireAdminToken(adminToken string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(adminToken) == "" {
+			sendJSONError(w, "Admin actions are not configured", http.StatusServiceUnavailable)
+			return
+		}
+		providedToken := r.Header.Get("X-Admin-Token")
+		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(adminToken)) != 1 {
+			sendJSONError(w, "Admin token is missing or invalid", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -122,8 +138,8 @@ type seedDemoResponse struct {
 	Finding findingResponse `json:"finding"`
 }
 
-func makeSeedDemoFindingHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeSeedDemoFindingHandler(adminToken string) http.HandlerFunc {
+	return requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -164,11 +180,11 @@ func makeSeedDemoFindingHandler() http.HandlerFunc {
 			status = http.StatusCreated
 		}
 		writeJSON(w, status, response)
-	}
+	})
 }
 
-func makeFindingActionHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeFindingActionHandler(adminToken string) http.HandlerFunc {
+	return requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -228,11 +244,11 @@ func makeFindingActionHandler() http.HandlerFunc {
 		}
 		response.MoneyMoved = false
 		writeJSON(w, http.StatusCreated, response)
-	}
+	})
 }
 
-func makeApproveActionHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeApproveActionHandler(adminToken string) http.HandlerFunc {
+	return requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -250,29 +266,44 @@ func makeApproveActionHandler() http.HandlerFunc {
 			return
 		}
 		defer tx.Rollback()
+		var status, actionType string
+		var storedResult []byte
+		err = tx.QueryRowContext(ctx, `SELECT status, action_type, result
+			FROM actions WHERE id = $1 FOR UPDATE`, actionID).
+			Scan(&status, &actionType, &storedResult)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				sendJSONError(w, "Action not found", http.StatusNotFound)
+			} else {
+				sendJSONError(w, "Action could not be approved", http.StatusInternalServerError)
+			}
+			return
+		}
+		if status != "proposed" {
+			sendJSONError(w, "Action is not proposed", http.StatusConflict)
+			return
+		}
+		moneyMoved, err := auditReportsMoneyMoved(storedResult)
+		if err != nil {
+			sendJSONError(w, "Action audit could not be verified", http.StatusInternalServerError)
+			return
+		}
+		if moneyMoved {
+			sendJSONError(w, "Action audit reports money moved; approval refused", http.StatusConflict)
+			return
+		}
+
 		var response actionResponse
-		var actionType string
 		err = tx.QueryRowContext(ctx, `UPDATE actions SET status = 'executed', updated_at = NOW(),
 			result = jsonb_set(COALESCE(result, '{"events":[]}'::jsonb), '{events}',
 				COALESCE(result->'events', '[]'::jsonb) || jsonb_build_array(
 					jsonb_build_object('status', 'approved', 'at', NOW(), 'money_moved', FALSE),
 					jsonb_build_object('status', 'executed', 'at', NOW(), 'money_moved', FALSE)), TRUE)
 			WHERE id = $1 AND status = 'proposed'
-			RETURNING id, finding_id, action_type, status, result`, actionID).
-			Scan(&response.ID, &response.FindingID, &actionType, &response.Status, &response.Result)
+			RETURNING id, finding_id, status, result`, actionID).
+			Scan(&response.ID, &response.FindingID, &response.Status, &response.Result)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				var exists bool
-				if lookupErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM actions WHERE id = $1)`, actionID).Scan(&exists); lookupErr != nil {
-					sendJSONError(w, "Action could not be approved", http.StatusInternalServerError)
-				} else if exists {
-					sendJSONError(w, "Action is not proposed", http.StatusConflict)
-				} else {
-					sendJSONError(w, "Action not found", http.StatusNotFound)
-				}
-			} else {
-				sendJSONError(w, "Action could not be approved", http.StatusInternalServerError)
-			}
+			sendJSONError(w, "Action could not be approved", http.StatusInternalServerError)
 			return
 		}
 		findingResult, err := tx.ExecContext(ctx, `UPDATE findings SET status = 'actioned', updated_at = NOW()
@@ -297,7 +328,38 @@ func makeApproveActionHandler() http.HandlerFunc {
 		response.ActionType = actionType
 		response.MoneyMoved = false
 		writeJSON(w, http.StatusOK, response)
+	})
+}
+
+func auditReportsMoneyMoved(result []byte) (bool, error) {
+	var value any
+	if err := json.Unmarshal(result, &value); err != nil {
+		return false, err
 	}
+	return auditValueReportsMoneyMoved(value), nil
+}
+
+func auditValueReportsMoneyMoved(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == "money_moved" {
+				if moved, ok := child.(bool); ok && moved {
+					return true
+				}
+			}
+			if auditValueReportsMoneyMoved(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if auditValueReportsMoneyMoved(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func routeID(path, prefix, suffix string) (int64, bool) {
