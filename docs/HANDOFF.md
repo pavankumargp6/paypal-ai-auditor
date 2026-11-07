@@ -16,7 +16,7 @@ This section supersedes earlier verification and gap statements below.
 - Added additive migration 005, `migrations/005_action_money_moved_check.sql`, and included it in disposable CI migrations. The check rejects `money_moved=true` anywhere in an action result, including proposed status. `NOT VALID` leaves historical violating rows in place and does not scan them when adding the constraint, but PostgreSQL enforces it for new rows and updated rows. Migration 005 has not been applied to production. Migration 004 is already present in the configured Render database.
 - README documents token-protected findings/action writes, unauthenticated reads and checkout, the correct evidence claims, all five migrations and exact PowerShell runner commands, the 005 SQL and NOT VALID behavior, and private token provision for judges.
 - Local checks: `gofmt -l .` printed no files; `go vet ./...` exited successfully; `go test -race -count=1 -v ./...` passed. The eight PostgreSQL integration tests skipped locally because `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` was intentionally unset; no database was accessed.
-- CI run [#47](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42366569470) passed for commit `39529ecc8b6187f31b23e0a150c465b32a8db49f`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including `TestPostgresDetectorsAndActionAudit`; none skipped. Current requested changes to the 005 constraint and checkout authentication are pending commit and CI.
+- CI run [#48](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42370483910) passed for commit `f7019f7014475b839505973fe58d2ab0f5d45688`: migration application, gofmt, vet, and race tests all succeeded. All eight PostgreSQL integration tests reported PASS, including the unsafe-audit test with the tightened 005 constraint; none skipped. The 005 migration ran only against the disposable CI database, not production.
 
 ### Pull request description
 
@@ -24,7 +24,7 @@ This section supersedes earlier verification and gap statements below.
 
 **Summary:** Refuse approval of unsafe stored action audits, require an administrator token for findings/action writes, include available order IDs in repeated-capture evidence, and add an additive database check. Update the UI, migration workflow, and documentation. No refunds or other money movement are performed by action approval.
 
-**Deployment notes:** Migration 004 was confirmed present in the configured Render database by the runner and a read-only schema query. Migration 005 has not been applied; the tightened database-level audit safeguard still requires separate approval. Set `APP_BASE_URL` and `PAYPAL_WEBHOOK_ID` in Render. Checkout endpoints do not require `ADMIN_TOKEN`; findings/action writes do.
+**Deployment notes:** Migration 004 was confirmed present in the configured Render database by the runner and a read-only schema query. Migration 005 has not been applied to production; the tightened database-level audit safeguard still requires separate approval. Set `APP_BASE_URL` and `PAYPAL_WEBHOOK_ID` in Render. Checkout endpoints do not require `ADMIN_TOKEN`; findings/action writes do. Judges must receive the admin token privately to approve the demo finding; the public repo contains no real token.
 
 ## Pre-submission verification (2026-11-07)
 
