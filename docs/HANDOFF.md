@@ -1,8 +1,42 @@
 # Revenue Guardian Handoff
 
-Updated: 2026-11-06
+Updated: 2026-11-07
 Repository: `C:\dev\paypal-ai-auditor`
 Branch: `feat/revenue-guardian`
+
+## Pre-submission verification (2026-11-07)
+
+- The initial worktree was clean at `86bfe14` but one commit behind `origin/feat/revenue-guardian`. It was fast-forwarded to `54aa758` (`Revamp spend intelligence dashboard UI`); that source commit matched the remote and the worktree was clean before documentation edits.
+- No application code was changed during this verification. No database, Render settings, PayPal endpoint, or Groq endpoint was accessed. The requester reports migrations 001–003 are already applied in production; this was not independently checked. Earlier handoff notes say migration 004 had not been applied to Render; its current production status was not checked.
+- Local checks on the source commit, with `DATABASE_URL` and `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL` removed from the test process:
+  - `gofmt -l .` printed `actions.go` and `main.go`. The Windows worktree has CRLF line endings for these two files (`git ls-files --eol`: index LF, worktree CRLF), and local Go is 1.27.3 while `go.mod` and CI use Go 1.26.8. The CI gofmt step passed for this source commit.
+  - `go vet ./...` exited successfully with no output.
+  - `go test -race -count=1 -v ./...` exited successfully: `PASS`, `ok paypal-ai-auditor 3.961s`, and `? paypal-ai-auditor/cmd/migrate [no test files]`. All eight PostgreSQL integration tests skipped because the dedicated test URL was intentionally unset; no database was contacted.
+- The latest GitHub Actions run for source commit `54aa758` is [run 42267185103](https://github.com/pavankumargp6/paypal-ai-auditor/actions/runs/42267185103), and it failed. Migration application, gofmt, and vet steps passed. Seven PostgreSQL integration tests passed; `TestPostgresDetectorsAndActionAudit` failed because the approval endpoint returned HTTP 200 for a pre-existing proposed action whose stored JSON result had `money_moved=true`. This issue was intentionally not fixed during this verification; CI is not green and this is a merge blocker.
+- The code uses integer minor-unit fields for payment/finding values and current calculations, but the legacy `captures.amount` column remains `DOUBLE PRECISION`. Real finding evidence contains capture IDs and order IDs where available, not invariably both. Groq generates spend insights, not explanations for deterministic findings. The API has no authentication; a dashboard click is not an authenticated human identity. These limits are called out in the rewritten README.
+- Secret-pattern scanning found credential-shaped data in the ignored local `.env`; values were not displayed. Tracked matches were limited to example placeholders, workflow test configuration, and redacted handoff samples. No secret values were printed or added to documentation.
+
+## Proposed pull request description
+
+**Title:** Revamp PayPal Sandbox spend intelligence and revenue-leakage dashboard
+
+### Summary
+
+- Add a responsive spend-intelligence dashboard with PayPal Sandbox transaction history, AI spend insights, leakage totals, synthetic demo data, and deterministic duplicate-capture/fee-mismatch findings.
+- Record finding actions and audit events without calling a refund API or moving money.
+- Verify PayPal webhook signatures and deduplicate receipts by event ID.
+
+### Verification
+
+- `go vet ./...` and local `go test -race -count=1 -v ./...` pass; local PostgreSQL integration tests skip without the dedicated test database.
+- The latest branch CI run is currently failing `TestPostgresDetectorsAndActionAudit` on approval of an unsafe pre-existing action record (`money_moved=true`). Do not merge until this is fixed and a new CI run is green.
+
+### Deployment notes
+
+- Per requester, production migrations 001–003 are already applied; this has not been independently verified here.
+- Migration 004 defines findings and actions and must be applied to the intended production database before relying on those endpoints. Database state was not checked during this task.
+- Set `APP_BASE_URL` to the deployed app URL and configure `PAYPAL_WEBHOOK_ID` in Render. The webhook endpoint fails closed when the webhook ID is absent.
+- This change does not modify Render settings or run database migrations.
 
 ## Goal and scope
 
