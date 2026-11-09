@@ -3,7 +3,7 @@
 A sandbox-first revenue-monitoring dashboard for small merchants. It brings PayPal Sandbox captures, signed webhooks, deterministic leakage checks, and evidence-grounded spend insights into one place, with a human in the loop for every action.
 
 - **Live demo:** https://paypal-ai-auditor.onrender.com (free tier: the first load after idle can take about 50 seconds)
-- **Demo video:** [VIDEO_LINK_HERE]
+- **Demo video:** yt link
 - **Status:** hackathon project, PayPal Sandbox only
 
 ## Problem and solution
@@ -129,7 +129,7 @@ PostgreSQL integration tests use only `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`. Wit
 ## Demo
 
 - **Live app:** https://paypal-ai-auditor.onrender.com
-- **Video walkthrough:** [VIDEO_LINK_HERE]
+- **Video walkthrough:** yt link
 - **Trying the approval flow:** seed the labeled demo finding, run the audit, then use its approve button. The UI prompts for the shared `ADMIN_TOKEN`; the token is provided to judges privately through the event's approved channel and is never in this repository. The button records a demo approval only. No refund is sent and no money moves.
 
 ## Limitations
