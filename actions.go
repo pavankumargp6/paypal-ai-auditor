@@ -229,7 +229,7 @@ func makeDemoApproveFindingHandler() http.HandlerFunc {
 					jsonb_build_object('status', 'approved', 'at', NOW(), 'money_moved', FALSE),
 					jsonb_build_object('status', 'executed', 'at', NOW(), 'money_moved', FALSE)),
 					'money_moved', FALSE, 'execution_mode', 'record_only'))
-			RETURNING id, finding_id, action_type, status, result`).Scan(
+			RETURNING id, finding_id, action_type, status, result`, findingID).Scan(
 			&response.ID, &response.FindingID, &response.ActionType, &response.Status, &response.Result)
 		if err != nil {
 			sendJSONError(w, "Demo action could not be recorded", http.StatusInternalServerError)
