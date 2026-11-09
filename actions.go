@@ -45,7 +45,8 @@ func registerFindingRoutes(mux *http.ServeMux, adminToken string) {
 	mux.HandleFunc("/api/findings", makeFindingsHandler())
 	mux.HandleFunc("/api/findings/detect", makeDetectFindingsHandler(adminToken))
 	mux.HandleFunc("/api/findings/leakage-score", makeLeakageScoreHandler())
-	mux.HandleFunc("/api/findings/seed-demo", makeSeedDemoFindingHandler(adminToken))
+	mux.HandleFunc("/api/findings/seed-demo", makeSeedDemoFindingHandler())
+	mux.HandleFunc("/api/findings/demo-approve", makeDemoApproveFindingHandler())
 	mux.HandleFunc("/api/findings/", makeFindingActionHandler(adminToken))
 	mux.HandleFunc("/api/leakage-score", makeLeakageScoreHandler())
 }
@@ -90,7 +91,7 @@ func makeFindingsHandler() http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		rows, err := db.QueryContext(ctx, `SELECT id, detector, status, amount_minor, currency, evidence, explanation, created_at
+		rows, err := db.QueryContext(ctx, `SELECT id, detector, status, amount_minor, currency, evidence, COALESCE(explanation, ''), created_at
 			FROM findings ORDER BY created_at DESC, id DESC LIMIT 500`)
 		if err != nil {
 			sendJSONError(w, "Findings query failed", http.StatusInternalServerError)
@@ -138,8 +139,8 @@ type seedDemoResponse struct {
 	Finding findingResponse `json:"finding"`
 }
 
-func makeSeedDemoFindingHandler(adminToken string) http.HandlerFunc {
-	return requireAdminToken(adminToken, func(w http.ResponseWriter, r *http.Request) {
+func makeSeedDemoFindingHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -163,8 +164,9 @@ func makeSeedDemoFindingHandler(adminToken string) http.HandlerFunc {
 		if err == nil {
 			response.Created = true
 		} else if errors.Is(err, sql.ErrNoRows) {
-			err = db.QueryRowContext(ctx, `SELECT id, detector, status, amount_minor, currency, evidence, explanation, created_at
-				FROM findings WHERE fingerprint = $1`, fingerprint).Scan(&response.Finding.ID, &response.Finding.Detector,
+			err = db.QueryRowContext(ctx, `UPDATE findings SET status = 'open', updated_at = NOW()
+				WHERE fingerprint = $1 AND detector = 'duplicate_capture' AND evidence->>'is_synthetic' = 'true'
+				RETURNING id, detector, status, amount_minor, currency, evidence, explanation, created_at`, fingerprint).Scan(&response.Finding.ID, &response.Finding.Detector,
 				&response.Finding.Status, &response.Finding.AmountMinor, &response.Finding.Currency, &response.Finding.Evidence,
 				&response.Finding.Explanation, &response.Finding.CreatedAt)
 		} else {
@@ -180,7 +182,77 @@ func makeSeedDemoFindingHandler(adminToken string) http.HandlerFunc {
 			status = http.StatusCreated
 		}
 		writeJSON(w, status, response)
-	})
+	}
+}
+
+func makeDemoApproveFindingHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			sendJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			sendJSONError(w, "Demo action could not be recorded", http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
+		var findingID int64
+		var status string
+		err = tx.QueryRowContext(ctx, `SELECT id, status FROM findings
+			WHERE fingerprint = 'synthetic-demo:duplicate_capture:v1'
+			  AND detector = 'duplicate_capture'
+			  AND evidence->>'is_synthetic' = 'true'
+			FOR UPDATE`).Scan(&findingID, &status)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				sendJSONError(w, "Demo finding not found", http.StatusNotFound)
+			} else {
+				sendJSONError(w, "Demo action could not be recorded", http.StatusInternalServerError)
+			}
+			return
+		}
+		if status != "open" && status != "acknowledged" {
+			sendJSONError(w, "Demo finding is not actionable", http.StatusConflict)
+			return
+		}
+
+		var response actionResponse
+		err = tx.QueryRowContext(ctx, `INSERT INTO actions (finding_id, action_type, status, result)
+			VALUES ($1, 'demo_record_only', 'executed',
+				jsonb_build_object('events', jsonb_build_array(
+					jsonb_build_object('status', 'proposed', 'at', NOW(), 'money_moved', FALSE),
+					jsonb_build_object('status', 'approved', 'at', NOW(), 'money_moved', FALSE),
+					jsonb_build_object('status', 'executed', 'at', NOW(), 'money_moved', FALSE)),
+					'money_moved', FALSE, 'execution_mode', 'record_only'))
+			RETURNING id, finding_id, action_type, status, result`).Scan(
+			&response.ID, &response.FindingID, &response.ActionType, &response.Status, &response.Result)
+		if err != nil {
+			sendJSONError(w, "Demo action could not be recorded", http.StatusInternalServerError)
+			return
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE findings SET status = 'actioned', updated_at = NOW()
+			WHERE id = $1 AND status IN ('open', 'acknowledged')`, findingID)
+		if err != nil {
+			sendJSONError(w, "Demo finding could not be actioned", http.StatusInternalServerError)
+			return
+		}
+		updated, err := result.RowsAffected()
+		if err != nil || updated != 1 {
+			sendJSONError(w, "Demo finding is not actionable", http.StatusConflict)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			sendJSONError(w, "Demo action could not be recorded", http.StatusInternalServerError)
+			return
+		}
+		response.MoneyMoved = false
+		writeJSON(w, http.StatusOK, response)
+	}
 }
 
 func makeFindingActionHandler(adminToken string) http.HandlerFunc {

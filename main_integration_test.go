@@ -542,7 +542,6 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	}
 
 	seedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
-	seedRequest.Header.Set("X-Admin-Token", testAdminToken)
 	seedResponse := httptest.NewRecorder()
 	mux.ServeHTTP(seedResponse, seedRequest)
 	if seedResponse.Code != http.StatusCreated {
@@ -566,12 +565,11 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 	}
 
 	secondSeedRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
-	secondSeedRequest.Header.Set("X-Admin-Token", testAdminToken)
 	secondSeedResponse := httptest.NewRecorder()
 	mux.ServeHTTP(secondSeedResponse, secondSeedRequest)
 	var secondSeed seedDemoResponse
 	if secondSeedResponse.Code != http.StatusOK || json.Unmarshal(secondSeedResponse.Body.Bytes(), &secondSeed) != nil ||
-		secondSeed.Created || secondSeed.Finding.ID != seeded.Finding.ID {
+		secondSeed.Created || secondSeed.Finding.ID != seeded.Finding.ID || secondSeed.Finding.Status != "open" {
 		t.Fatalf("idempotent seed response=%d body=%s decoded=%+v", secondSeedResponse.Code, secondSeedResponse.Body.String(), secondSeed)
 	}
 	seededScore := requestScore(http.MethodPost)
@@ -581,20 +579,18 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 		t.Fatalf("score after seed=%+v baseline=%+v; expected one simulated $25 finding without changing live totals", seededScore, baseline)
 	}
 
-	proposalRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/findings/%d/action", seeded.Finding.ID), strings.NewReader(`{"action_type":"record_recovery","description":"Demo action only"}`))
-	proposalRequest.Header.Set("X-Admin-Token", testAdminToken)
-	proposalResponse := httptest.NewRecorder()
-	mux.ServeHTTP(proposalResponse, proposalRequest)
-	var proposal actionResponse
-	if proposalResponse.Code != http.StatusCreated || json.Unmarshal(proposalResponse.Body.Bytes(), &proposal) != nil {
-		t.Fatalf("demo action proposal response=%d %s", proposalResponse.Code, proposalResponse.Body.String())
-	}
-	approveRequest := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/actions/%d/approve", proposal.ID), nil)
-	approveRequest.Header.Set("X-Admin-Token", testAdminToken)
+	approveRequest := httptest.NewRequest(http.MethodPost, "/api/findings/demo-approve", nil)
 	approveResponse := httptest.NewRecorder()
 	mux.ServeHTTP(approveResponse, approveRequest)
 	if approveResponse.Code != http.StatusOK {
 		t.Fatalf("demo action approval response=%d %s", approveResponse.Code, approveResponse.Body.String())
+	}
+	var demoAction actionResponse
+	if err := json.Unmarshal(approveResponse.Body.Bytes(), &demoAction); err != nil {
+		t.Fatalf("decode tokenless demo action response: %v", err)
+	}
+	if demoAction.ActionType != "demo_record_only" || demoAction.MoneyMoved || demoAction.FindingID != seeded.Finding.ID {
+		t.Fatalf("tokenless demo action response=%+v", demoAction)
 	}
 	afterApproval := requestScore(http.MethodGet)
 	if afterApproval.LostMinor != baseline.LostMinor || afterApproval.RecoverableMinor != baseline.RecoverableMinor ||
@@ -604,6 +600,39 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 		afterApproval.SimulatedRecoveredMinor != baseline.SimulatedRecoveredMinor+2500 {
 		t.Fatalf("score after demo approval=%+v baseline=%+v", afterApproval, baseline)
 	}
+}
+
+func TestPostgresFindingsHandlerHandlesNullExplanation(t *testing.T) {
+	testDB := usePostgresIntegrationDB(t)
+	fingerprint := fmt.Sprintf("null-explanation-test-%d", time.Now().UnixNano())
+	var findingID int64
+	if err := testDB.QueryRow(`INSERT INTO findings (fingerprint, detector, amount_minor, currency, evidence, explanation)
+		VALUES ($1, 'duplicate_capture', 2500, 'USD', '{"test":"null-explanation"}'::jsonb, NULL)
+		RETURNING id`, fingerprint).Scan(&findingID); err != nil {
+		t.Fatalf("insert finding with NULL explanation: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testDB.Exec(`DELETE FROM findings WHERE fingerprint = $1`, fingerprint)
+	})
+
+	response := httptest.NewRecorder()
+	makeFindingsHandler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/findings", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("findings response=%d %s, want 200", response.Code, response.Body.String())
+	}
+	var findings []findingResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &findings); err != nil {
+		t.Fatalf("decode findings: %v", err)
+	}
+	for _, finding := range findings {
+		if finding.ID == findingID {
+			if finding.Explanation != "" {
+				t.Fatalf("NULL explanation decoded as %q, want empty string", finding.Explanation)
+			}
+			return
+		}
+	}
+	t.Fatalf("findings response omitted inserted row %d", findingID)
 }
 
 func TestPostgresInsightEvidenceExcludesSyntheticAttempts(t *testing.T) {

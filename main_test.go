@@ -234,12 +234,21 @@ func TestAPIRouteAuthenticationScopes(t *testing.T) {
 		}
 	}
 
-	for _, path := range []string{"/api/findings/detect", "/api/findings/seed-demo", "/api/findings/1/action", "/api/actions/1/approve"} {
+	for _, path := range []string{"/api/findings/detect", "/api/findings/1/action", "/api/actions/1/approve"} {
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"action_type":"test"}`))
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, request)
 		if response.Code != http.StatusServiceUnavailable {
 			t.Errorf("%s without configured token returned %d, want fail-closed 503", path, response.Code)
+		}
+	}
+
+	for _, path := range []string{"/api/findings/seed-demo", "/api/findings/demo-approve"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s without token returned %d, want method validation before any admin auth", path, response.Code)
 		}
 	}
 }

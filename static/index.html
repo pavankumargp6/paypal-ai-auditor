@@ -381,7 +381,7 @@
                 button.className = "action-button w-full bg-blue-700 text-white hover:bg-blue-800 sm:w-auto";
                 button.type = "button";
                 button.textContent = "Approve Refund";
-                button.addEventListener("click", () => approveFinding(finding.id, button));
+                button.addEventListener("click", () => approveFinding(finding, button));
                 action.appendChild(button);
                 const feedback = document.createElement("span");
                 feedback.className = "text-xs text-slate-500";
@@ -448,19 +448,11 @@
         async function seedDemoFinding() {
             const button = document.getElementById("seed-demo-btn");
             const status = document.getElementById("findings-status");
-            const adminToken = promptAdminToken();
-            if (!adminToken) {
-                status.textContent = "Admin token is required to seed a demo finding.";
-                return;
-            }
             button.disabled = true;
             status.textContent = "Seeding a simulated finding…";
             try {
-                const result = await apiJSON("/api/findings/seed-demo", {
-                    method: "POST",
-                    headers: adminHeaders(adminToken)
-                });
-                status.textContent = result.created
+                const result = await apiJSON("/api/findings/seed-demo", { method: "POST" });
+                status.textContent = result.created || result.finding.status === "open"
                     ? "Synthetic demo leak added. No PayPal transaction was made."
                     : `Synthetic demo finding already exists (${result.finding.status}).`;
                 await refreshFindingsDashboard();
@@ -497,28 +489,34 @@
             }
         }
 
-        async function approveFinding(findingID, button) {
+        async function approveFinding(finding, button) {
             const feedback = button.parentElement.querySelector("[aria-live]");
-            const adminToken = promptAdminToken();
-            if (!adminToken) {
-                feedback.textContent = "Admin token is required to record approval.";
-                return;
-            }
+            const isDemo = finding.evidence?.is_synthetic === true &&
+                finding.evidence?.demo_key === "duplicate_capture_v1";
+            const adminToken = isDemo ? null : promptAdminToken();
+            if (!isDemo && !adminToken) return;
             button.disabled = true;
             feedback.textContent = "Recording approval…";
             try {
-                const action = await apiJSON(`/api/findings/${encodeURIComponent(findingID)}/action`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
-                    body: JSON.stringify({ action_type: "record_refund", description: "Demo refund approval recorded; no money moved." })
-                });
-                if (action.money_moved !== false) throw new Error("Safety check failed: proposal reports money moved.");
-                const approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, {
-                    method: "POST",
-                    headers: adminHeaders(adminToken)
-                });
+                let approved;
+                if (isDemo) {
+                    approved = await apiJSON("/api/findings/demo-approve", { method: "POST" });
+                } else {
+                    const action = await apiJSON(`/api/findings/${encodeURIComponent(finding.id)}/action`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", ...adminHeaders(adminToken) },
+                        body: JSON.stringify({ action_type: "record_refund", description: "Approval recorded; no money moved." })
+                    });
+                    if (action.money_moved !== false) throw new Error("Safety check failed: proposal reports money moved.");
+                    approved = await apiJSON(`/api/actions/${encodeURIComponent(action.id)}/approve`, {
+                        method: "POST",
+                        headers: adminHeaders(adminToken)
+                    });
+                }
                 if (approved.money_moved !== false) throw new Error("Safety check failed: approval reports money moved.");
-                document.getElementById("findings-status").textContent = "Approval recorded. No refund was sent and no money moved.";
+                document.getElementById("findings-status").textContent = isDemo
+                    ? "Demo approval recorded. No refund was sent and no money moved."
+                    : "Approval recorded. No refund was sent and no money moved.";
                 await refreshFindingsDashboard();
             } catch (error) {
                 console.error("[approve finding]", error);

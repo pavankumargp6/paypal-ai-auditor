@@ -6,7 +6,7 @@ A sandbox-first revenue-monitoring dashboard for small merchants. It brings PayP
 
 Small merchants need a practical way to review payment activity and spot possible duplicate captures or fee mismatches without treating an AI-generated answer as a financial decision. This application records Sandbox payment attempts, runs deterministic Go detectors over recorded evidence, and presents findings and a Groq-generated summary in a browser dashboard.
 
-The findings workflow is for review and record-keeping. Finding detection/seeding, action proposals, and approvals require the administrator's `ADMIN_TOKEN`; the browser prompts for it per operation and does not store it. Approval does not issue a refund or move money. Sandbox checkout creates and captures a test payment after the Sandbox buyer approves it; PayPal validates the buyer approval and these checkout endpoints do not require the admin token.
+The findings workflow is for review and record-keeping. Detector runs and actions on real findings require the administrator's `ADMIN_TOKEN`; the browser prompts for it per operation and does not store it. Seeding and approving the single fixed synthetic demo finding are tokenless demo-only operations. Approval does not issue a refund or move money. Sandbox checkout creates and captures a test payment after the Sandbox buyer approves it; PayPal validates the buyer approval and these checkout endpoints do not require the admin token.
 
 ## Architecture
 
@@ -42,7 +42,8 @@ flowchart LR
 - **Detection is deterministic.** Go code decides whether duplicate-capture or fee-mismatch findings exist and calculates their amounts. The LLM only generates spend insight; it does not determine finding status, amounts, or deterministic finding explanations.
 - **Evidence:** findings record capture IDs and any corresponding order ID available from attempts. The repeated-persisted-capture detector looks up an order ID through related attempts. Demo findings use synthetic IDs and are labeled and excluded from live totals.
 - **AI insight:** the model receives matched real completed capture evidence only, uses a strict JSON Schema response at temperature 0, and its cited order/capture pairs are checked against the supplied evidence.
-- **Write authentication:** finding detection/seeding, action proposals, and approvals require `ADMIN_TOKEN` in the `X-Admin-Token` header and fail closed if the server token is unset. Checkout is not gated by this admin token; PayPal Sandbox handles buyer approval. The UI prompts for the token per findings/action operation and does not persist or log it. PayPal webhooks instead require signature verification. Read-only API endpoints are unauthenticated, and the shared token does not establish an individual human identity.
+- **Write authentication:** detector runs and action proposals/approvals for non-demo findings require `ADMIN_TOKEN` in the `X-Admin-Token` header and fail closed if the server token is unset. Only the fixed synthetic demo finding can be seeded and approved without a token; the demo approval endpoint cannot target other findings. Checkout is not gated by this admin token; PayPal Sandbox handles buyer approval. The UI prompts for the token only for protected real-finding writes and does not persist or log it. PayPal webhooks instead require signature verification. Read-only API endpoints are unauthenticated, and the shared token does not establish an individual human identity.
+- **Finding list compatibility:** `findings.explanation` is nullable in the schema; the list endpoint converts SQL `NULL` to an empty explanation so one such row does not break the entire response.
 - **Action audit:** action proposals and approvals only record state and audit events. They do not call PayPal, send a refund, or move money. Approval refuses an existing action audit that reports `money_moved=true`. Migration 005 will reject any inserted or updated action whose JSON result contains `money_moved=true`, including proposed actions. The application approval guard works even before migration 005 is applied.
 - **Money representation:** application payment and finding amounts use integer minor units. The legacy `captures.amount` column remains `DOUBLE PRECISION` for compatibility; `amount_minor` is used for current money calculations.
 - **Sandbox only:** the payment flow targets PayPal Sandbox, not live payments.
@@ -73,7 +74,7 @@ Use Go 1.26.8 or a compatible Go toolchain. Configure the following environment 
 | `GROQ_API_KEY` | No for startup | Groq API key; spend insight is unavailable without a valid key. |
 | `APP_BASE_URL` | No for local development | PayPal return/cancel URL base; defaults to `http://localhost:8080`. Set it to the deployed app URL in Render. |
 | `PAYPAL_WEBHOOK_ID` | No for startup; required for webhook verification | PayPal Sandbox webhook ID. The webhook endpoint fails closed when it is missing. |
-| `ADMIN_TOKEN` | Required for findings/action write endpoints | Long, randomly generated administrator token. If unset, those endpoints fail closed. Not required for PayPal Sandbox checkout. |
+| `ADMIN_TOKEN` | Required for detector runs and non-demo finding/action writes | Long, randomly generated administrator token. If unset, protected endpoints fail closed. Not required for checkout or the fixed synthetic demo flow. |
 | `PORT` | No | HTTP listen port; defaults to `8080`. |
 
 The migration runner accepts exactly one migration-file argument and loads `.env` from the repository root. Run the migrations one at a time, in order, from the repository root. Do not rely on shell wildcard expansion:
@@ -120,7 +121,7 @@ PostgreSQL integration tests use only `PAYPAL_AI_AUDITOR_TEST_DATABASE_URL`. Wit
 
 - **Live app:** [paypal-ai-auditor.onrender.com](https://paypal-ai-auditor.onrender.com)
 - **Video walkthrough:** [Add video link](VIDEO_LINK_TBD)
-- **Judge approvals:** Seed the labeled demo finding, then use its “Approve Refund” button. The UI prompts for the shared `ADMIN_TOKEN` and submits the proposal and approval; provide the token to judges privately through the event's approved channel. Never commit or embed a real token in the public repository. This records a demo action only; no refund is sent.
+- **Judge approvals:** Click “Seed Demo Leak,” then “Approve Refund” on that synthetic finding. This fixed demo flow needs no token and only records an action against the synthetic finding; it sends no refund. Approval of real findings remains protected by `ADMIN_TOKEN`. Never hard-code or publish a real token.
 
 ## Limitations
 
