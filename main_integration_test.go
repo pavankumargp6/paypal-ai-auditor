@@ -600,6 +600,33 @@ func TestPostgresDemoSeedAndLeakageScoreRoutes(t *testing.T) {
 		afterApproval.SimulatedRecoveredMinor != baseline.SimulatedRecoveredMinor+2500 {
 		t.Fatalf("score after demo approval=%+v baseline=%+v", afterApproval, baseline)
 	}
+
+	if _, err := testDB.Exec(`UPDATE findings SET created_at = NOW() - INTERVAL '1 hour',
+		updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, seeded.Finding.ID); err != nil {
+		t.Fatalf("age actioned demo finding before reset: %v", err)
+	}
+	resetRequest := httptest.NewRequest(http.MethodPost, "/api/findings/seed-demo", nil)
+	resetResponse := httptest.NewRecorder()
+	mux.ServeHTTP(resetResponse, resetRequest)
+	var reset seedDemoResponse
+	if resetResponse.Code != http.StatusOK || json.Unmarshal(resetResponse.Body.Bytes(), &reset) != nil ||
+		reset.Created || reset.Finding.ID != seeded.Finding.ID || reset.Finding.Status != "open" {
+		t.Fatalf("reset demo response=%d body=%s decoded=%+v", resetResponse.Code, resetResponse.Body.String(), reset)
+	}
+	var updatedAt time.Time
+	var status string
+	if err := testDB.QueryRow(`SELECT status, created_at, updated_at FROM findings WHERE id = $1`, seeded.Finding.ID).
+		Scan(&status, &reset.Finding.CreatedAt, &updatedAt); err != nil {
+		t.Fatalf("load reset demo timestamps: %v", err)
+	}
+	if status != "open" || time.Since(reset.Finding.CreatedAt) > time.Minute || time.Since(updatedAt) > time.Minute {
+		t.Fatalf("reset demo timestamps/status: status=%q created_at=%s updated_at=%s", status, reset.Finding.CreatedAt, updatedAt)
+	}
+	afterReset := requestScore(http.MethodGet)
+	if afterReset.SimulatedRecoverableMinor != baseline.SimulatedRecoverableMinor+2500 ||
+		afterReset.SimulatedRecoveredMinor != baseline.SimulatedRecoveredMinor {
+		t.Fatalf("score after reset=%+v baseline=%+v", afterReset, baseline)
+	}
 }
 
 func TestPostgresFindingsHandlerHandlesNullExplanation(t *testing.T) {

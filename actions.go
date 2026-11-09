@@ -160,25 +160,16 @@ func makeSeedDemoFindingHandler() http.HandlerFunc {
 		var response seedDemoResponse
 		err := db.QueryRowContext(ctx, `INSERT INTO findings (fingerprint, detector, status, amount_minor, currency, evidence, explanation)
 			VALUES ($1, 'duplicate_capture', 'open', 2500, 'USD', $2::jsonb, $3)
-			ON CONFLICT (fingerprint) DO NOTHING
-			RETURNING id, detector, status, amount_minor, currency, evidence, explanation, created_at`,
+			ON CONFLICT (fingerprint) DO UPDATE SET
+				status = 'open',
+				created_at = NOW(),
+				updated_at = NOW()
+			RETURNING id, detector, status, amount_minor, currency, evidence, explanation, created_at, (xmax = 0)`,
 			fingerprint, evidence, explanation).Scan(&response.Finding.ID, &response.Finding.Detector, &response.Finding.Status,
 			&response.Finding.AmountMinor, &response.Finding.Currency, &response.Finding.Evidence,
-			&response.Finding.Explanation, &response.Finding.CreatedAt)
-		if err == nil {
-			response.Created = true
-		} else if errors.Is(err, sql.ErrNoRows) {
-			err = db.QueryRowContext(ctx, `UPDATE findings SET status = 'open', updated_at = NOW()
-				WHERE fingerprint = $1 AND detector = 'duplicate_capture' AND evidence->>'is_synthetic' = 'true'
-				RETURNING id, detector, status, amount_minor, currency, evidence, explanation, created_at`, fingerprint).Scan(&response.Finding.ID, &response.Finding.Detector,
-				&response.Finding.Status, &response.Finding.AmountMinor, &response.Finding.Currency, &response.Finding.Evidence,
-				&response.Finding.Explanation, &response.Finding.CreatedAt)
-		} else {
-			sendJSONError(w, "Demo finding could not be seeded", http.StatusInternalServerError)
-			return
-		}
+			&response.Finding.Explanation, &response.Finding.CreatedAt, &response.Created)
 		if err != nil {
-			sendJSONError(w, "Demo finding could not be loaded", http.StatusInternalServerError)
+			sendJSONError(w, "Demo finding could not be seeded", http.StatusInternalServerError)
 			return
 		}
 		status := http.StatusOK
