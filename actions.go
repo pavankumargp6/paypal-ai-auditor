@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -94,6 +95,7 @@ func makeFindingsHandler() http.HandlerFunc {
 		rows, err := db.QueryContext(ctx, `SELECT id, detector, status, amount_minor, currency, evidence, COALESCE(explanation, ''), created_at
 			FROM findings ORDER BY created_at DESC, id DESC LIMIT 500`)
 		if err != nil {
+			log.Printf("findings query failed: %v", err)
 			sendJSONError(w, "Findings query failed", http.StatusInternalServerError)
 			return
 		}
@@ -103,12 +105,14 @@ func makeFindingsHandler() http.HandlerFunc {
 			var finding findingResponse
 			if err := rows.Scan(&finding.ID, &finding.Detector, &finding.Status, &finding.AmountMinor,
 				&finding.Currency, &finding.Evidence, &finding.Explanation, &finding.CreatedAt); err != nil {
+				log.Printf("findings row scan failed: %v", err)
 				sendJSONError(w, "Findings query failed", http.StatusInternalServerError)
 				return
 			}
 			findings = append(findings, finding)
 		}
 		if err := rows.Err(); err != nil {
+			log.Printf("findings row iteration failed: %v", err)
 			sendJSONError(w, "Findings query failed", http.StatusInternalServerError)
 			return
 		}
