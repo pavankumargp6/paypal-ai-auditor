@@ -3,7 +3,7 @@
 A sandbox-first revenue-monitoring dashboard for small merchants. It brings PayPal Sandbox captures, signed webhooks, deterministic leakage checks, and evidence-grounded spend insights into one place, with a human in the loop for every action.
 
 - **Live demo:** https://paypal-ai-auditor.onrender.com (free tier: the first load after idle can take about 50 seconds)
-- **Demo video:** yt link
+- **Demo video:** https://youtu.be/3Nml_QApt-Y
 - **Status:** hackathon project, PayPal Sandbox only
 
 ## Problem and solution
